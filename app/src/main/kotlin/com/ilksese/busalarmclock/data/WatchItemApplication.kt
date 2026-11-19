@@ -31,7 +31,7 @@ class WatchItemApplication(
   fun showAdd() {
     if (state.value.saving) return
     revision.incrementAndGet()
-    mutableState.update { it.copy(adding = true, confirmation = null, codes = emptyList(), message = null, loading = false, deleting = null) }
+    mutableState.update { it.copy(adding = true, cameraActive = false, confirmation = null, codes = emptyList(), message = null, loading = false, deleting = null) }
   }
 
   /** 编辑已有关注项：站台固定不换绑，只改选线路；离线也先展示本机记录。 */
@@ -56,8 +56,51 @@ class WatchItemApplication(
   fun cancel() {
     if (state.value.saving) return
     revision.incrementAndGet()
-    mutableState.update { it.copy(adding = false, editing = false, confirmation = null, codes = emptyList(), loading = false, message = null) }
+    mutableState.update { it.copy(adding = false, cameraActive = false, editing = false, confirmation = null, codes = emptyList(), loading = false, message = null) }
   }
+
+  /**
+   * 进入相机扫码。相机只在添加流程内、且用户主动点扫码后开启；
+   * 这里不产生任何请求，退出添加流程即关闭，不存在候车期间的相机前台服务。
+   */
+  fun openCamera() {
+    if (state.value.saving) return
+    mutableState.update { it.copy(adding = true, cameraActive = true, message = null) }
+  }
+
+  fun closeCamera() {
+    mutableState.update { it.copy(cameraActive = false) }
+  }
+
+  fun cameraPermissionDenied() {
+    mutableState.update {
+      it.copy(cameraActive = false, adding = true, message = "相机未授权，仍可从相册选择；不会保存照片")
+    }
+  }
+
+  /**
+   * 相机取景识别到一条二维码：先经与相册图片完全相同的严格来源校验，
+   * 通过才复用同一导入入口；不受支持或无效码保留取景以便继续扫。
+   */
+  suspend fun cameraDecoded(rawValue: String) {
+    if (state.value.saving) return
+    val code = parseCameraCode(rawValue)
+    if (code == null) {
+      mutableState.update { it.copy(message = "这不是受支持的公交站台码，不会打开陌生网页", cameraActive = true) }
+      return
+    }
+    revision.incrementAndGet()
+    mutableState.update { it.copy(cameraActive = false, message = null) }
+    importCode(code)
+  }
+
+  /**
+   * 相机码是否会被这个入口接管，供取景层判断本次识别要不要占用“一码只交付一次”的机会。
+   * 与 [cameraDecoded] 共用同一校验，不在取景层重复站台规则。
+   */
+  fun isCameraCodeAccepted(rawValue: String): Boolean = !state.value.saving && parseCameraCode(rawValue) != null
+
+  private fun parseCameraCode(rawValue: String): String? = QrPayloadParser.parseGpsNumber(rawValue)
 
   fun showCurrent(current: Boolean) {
     cancel()
@@ -411,6 +454,7 @@ data class WatchItemsState(
   val saving: Boolean = false,
   val deleting: String? = null,
   val message: String? = null,
+  val cameraActive: Boolean = false,
 )
 
 /** 数据替换仅在统一应用边界进行；生产实现始终访问同一 Room 数据库。 */
