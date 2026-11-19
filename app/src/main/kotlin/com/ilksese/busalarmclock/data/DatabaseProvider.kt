@@ -10,7 +10,7 @@ import kotlinx.coroutines.flow.first
 object DatabaseProvider {
   fun create(context: Context): AppDatabase =
     Room.databaseBuilder(context, AppDatabase::class.java, "bus-alarm-clock.db")
-      .addMigrations(MIGRATION_1_2)
+      .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
       .build()
 }
 
@@ -18,5 +18,6 @@ object DatabaseProvider {
 class RoomWatchItemStore(private val database: AppDatabase) : WatchItemStore {
   override suspend fun find(stopCode: String) = database.watchItemDao().find(stopCode)
   override suspend fun save(item: WatchItemEntity) = database.watchItemDao().save(item)
+  override suspend fun delete(stopCode: String) = database.watchItemDao().delete(stopCode)
   override suspend fun all() = database.watchItemDao().observeAll().first()
 }

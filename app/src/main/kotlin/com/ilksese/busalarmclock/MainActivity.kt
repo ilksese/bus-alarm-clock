@@ -64,7 +64,7 @@ import kotlinx.coroutines.launch
 /** 配置变化复用同一行为入口与请求状态，不因重建 Activity 绕过请求间隔。 */
 class WatchItemsViewModel(application: Application) : AndroidViewModel(application) {
   private val database = DatabaseProvider.create(application)
-  val applicationBehavior = WatchItemApplication(BusSourceClient(), RoomWatchItemStore(database))
+  val applicationBehavior = WatchItemApplication(BusSourceClient(), RoomWatchItemStore(database), QuietLineStatusNotifier(application))
   override fun onCleared() { database.close() }
 }
 
@@ -158,27 +158,45 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
           } else {
             item {
               Text(draft.station.stationName, style = MaterialTheme.typography.headlineSmall)
-              Text("站台 ${draft.stopCode}${if (draft.stopCode == draft.station.defaultStopCode) " · 二维码指向站台" else " · 同名另一站台"}")
+              Text("站台 ${draft.stopCode}${if (draft.editing) " · 编辑选线，换站台请另行添加" else if (draft.stopCode == draft.station.defaultStopCode) " · 二维码指向站台" else " · 同名另一站台"}")
             }
-            item { Text("核对具体上车站台", style = MaterialTheme.typography.labelLarge) }
-            draft.station.stops.forEach { stop ->
-              item(key = "stop-${stop.stopCode}") {
-                val isSelected = draft.stopCode == stop.stopCode
-                val choose: () -> Unit = { scope.launch { application.chooseStop(stop.stopCode) }; Unit }
-                // D 原型整行可点；用 selectable 承担整行点击与单选语义，RadioButton 自身不再响应点击。
-                Row(
-                  Modifier.fillMaxWidth()
-                    .selectable(selected = isSelected, enabled = !state.saving, role = Role.RadioButton, onClick = choose)
-                    .padding(vertical = 12.dp),
-                  verticalAlignment = Alignment.CenterVertically,
-                ) {
-                  RadioButton(selected = isSelected, enabled = !state.saving, onClick = null)
-                  Spacer(Modifier.width(12.dp))
-                  Text("站台 ${stop.stopCode}${if (stop.stopCode == draft.station.defaultStopCode) " · 二维码默认" else " · 同名另一站台"}")
+            if (draft.editing) {
+              item { Text("编辑已有关注项：站台不变，只改选线路。", style = MaterialTheme.typography.bodySmall) }
+            } else {
+              item { Text("核对具体上车站台", style = MaterialTheme.typography.labelLarge) }
+              draft.station.stops.forEach { stop ->
+                item(key = "stop-${stop.stopCode}") {
+                  val isSelected = draft.stopCode == stop.stopCode
+                  val choose: () -> Unit = { scope.launch { application.chooseStop(stop.stopCode) }; Unit }
+                  // D 原型整行可点；用 selectable 承担整行点击与单选语义，RadioButton 自身不再响应点击。
+                  Row(
+                    Modifier.fillMaxWidth()
+                      .selectable(selected = isSelected, enabled = !state.saving, role = Role.RadioButton, onClick = choose)
+                      .padding(vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                    RadioButton(selected = isSelected, enabled = !state.saving, onClick = null)
+                    Spacer(Modifier.width(12.dp))
+                    Text("站台 ${stop.stopCode}${if (stop.stopCode == draft.station.defaultStopCode) " · 二维码默认" else " · 同名另一站台"}")
+                  }
+                }
+              }
+              if (draft.isUpdate) item { Text("已关注此站台：保存会更新已有项，取消保持原选择。", color = MaterialTheme.colorScheme.primary) }
+            }
+            // 过时记录置灰且只能删除；即使全部过时也保留关注项本身。
+            draft.obsoleteRecords.forEach { record ->
+              item(key = "obsolete-${record.identity}") {
+                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                  RouteTag(record.lineName, enabled = false)
+                  Spacer(Modifier.width(11.dp))
+                  Column(Modifier.weight(1f)) {
+                    Text("开往${record.endStationName}", style = MaterialTheme.typography.bodyMedium, color = SubText)
+                    Text("过时，仅可删除记录", style = MaterialTheme.typography.bodySmall, color = SubText)
+                  }
+                  TextButton(enabled = !state.saving, onClick = { scope.launch { application.removeRecord(record.identity) } }) { Text("删除过时记录") }
                 }
               }
             }
-            if (draft.isUpdate) item { Text("已关注此站台：保存会更新已有项，取消保持原选择。", color = MaterialTheme.colorScheme.primary) }
             item { Text("选择你可乘坐的线路方向", style = MaterialTheme.typography.titleMedium) }
             draft.availableLines.forEach { line ->
               item(key = "line-${line.identity}") {
@@ -208,6 +226,9 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
         }
         else -> {
           if (state.items.isEmpty()) item { EmptyState("下一站，\n从这里开始。", "点右上角加号，识别公交二维码并保存你的上车站台。") }
+          if (state.items.isNotEmpty()) {
+            item { SecondaryAction("核对线路最新状态", enabled = !state.loading && !state.saving) { scope.launch { application.refresh() } } }
+          }
           state.items.forEach { item ->
             item(key = item.stopCode) {
               Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(top = 19.dp, bottom = 23.dp)) {
@@ -215,12 +236,26 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
                 Text("站台 ${item.stopCode} · ${item.selectedLines.size} 条已选线路", style = MaterialTheme.typography.bodySmall, color = SubText)
                 item.selectedLines.forEach { line ->
                   Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    RouteTag(line.lineName)
+                    // 过时记录置灰且只允许删除，避免把已消失的方向继续当作可乘线路。
+                    RouteTag(line.lineName, enabled = !line.obsolete)
                     Spacer(Modifier.width(11.dp))
-                    Text("开往${line.endStationName}", style = MaterialTheme.typography.bodyMedium, color = BodyText)
+                    Column(Modifier.weight(1f)) {
+                      Text("开往${line.endStationName}", style = MaterialTheme.typography.bodyMedium, color = if (line.obsolete) SubText else BodyText)
+                      if (line.obsolete) Text("过时 · 不参与提醒", style = MaterialTheme.typography.bodySmall, color = SubText)
+                    }
+                    if (line.obsolete) TextButton(onClick = { scope.launch { application.removeStoredRecord(item.stopCode, line.identity) } }) { Text("删除记录") }
                   }
                 }
-                Text("本机保存 · 尚未联网核对", style = MaterialTheme.typography.bodySmall, color = SubText)
+                Text(
+                  if (item.lastCheckedAt == null) "本机保存 · 尚未联网核对"
+                  else "最后成功核对：${DateFormat.getTimeInstance().format(Date(item.lastCheckedAt))}",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = SubText,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                  TextButton(enabled = !state.saving, onClick = { scope.launch { application.edit(item.stopCode) } }) { Text("编辑选线") }
+                  TextButton(enabled = !state.saving, onClick = { application.requestDelete(item.stopCode) }) { Text("删除关注项") }
+                }
                 HorizontalDivider(color = Hairline)
               }
             }
@@ -235,6 +270,16 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
     text = { Column { state.codes.forEach { code -> TextButton(onClick = { scope.launch { application.importCode(code) } }) { Text("站台码 $code") } } } },
     confirmButton = {}, dismissButton = { TextButton(onClick = { cancel() }) { Text("取消") } },
   )
+  state.deleting?.let { stopCode ->
+    val item = state.items.firstOrNull { it.stopCode == stopCode }
+    AlertDialog(
+      onDismissRequest = { application.cancelDelete() },
+      title = { Text("删除关注项") },
+      text = { Text("将删除站台 $stopCode 的关注项与已保存的 ${item?.selectedLines?.size ?: 0} 条线路记录，不会开始或结束任何等车。") },
+      confirmButton = { TextButton(onClick = { scope.launch { application.confirmDelete() } }) { Text("确认删除") } },
+      dismissButton = { TextButton(onClick = { application.cancelDelete() }) { Text("取消") } },
+    )
+  }
 }
 
 /** 首页留白与原生层级，不以规则文字堆叠替代主状态。 */
@@ -279,12 +324,12 @@ private fun SecondaryAction(text: String, enabled: Boolean = true, onClick: () -
 
 /** D 原型线路标签：浅柠底、深石蓝、8dp 圆角，最小 43dp 宽。 */
 @Composable
-private fun RouteTag(lineName: String) {
+private fun RouteTag(lineName: String, enabled: Boolean = true) {
   Box(
-    Modifier.heightIn(min = 29.dp).width(43.dp).background(Accent, RoundedCornerShape(8.dp)),
+    Modifier.heightIn(min = 29.dp).width(43.dp).background(if (enabled) Accent else SoftSurface, RoundedCornerShape(8.dp)),
     contentAlignment = Alignment.Center,
   ) {
-    Text(lineName.removeSuffix("路"), style = MaterialTheme.typography.labelMedium, color = DeepBlue, maxLines = 1)
+    Text(lineName.removeSuffix("路"), style = MaterialTheme.typography.labelMedium, color = if (enabled) DeepBlue else SubText, maxLines = 1)
   }
 }
 

@@ -18,3 +18,10 @@ val MIGRATION_1_2 = object : Migration(1, 2) {
     }
   }
 }
+
+/** 记录最近一次成功核对的获取时间；失败时保持原值，界面据此区分尚未联网核对。 */
+val MIGRATION_2_3 = object : Migration(2, 3) {
+  override fun migrate(database: SupportSQLiteDatabase) {
+    database.execSQL("ALTER TABLE watch_items ADD COLUMN lastCheckedAt INTEGER")
+  }
+}

@@ -10,6 +10,11 @@ data class WatchItemImportSession(
   val fetchedAt: Long? = null,
   val nextAllowedAt: Long? = null,
   val restoreOriginalOnLoad: Boolean = true,
+  /** 编辑已有关注项：站台固定，只允许改选线路。 */
+  val editing: Boolean = false,
+  /** 本机保存的线路记录；带过时标记的记录只允许删除，不参与选择。 */
+  val records: List<SavedLine> = emptyList(),
 ) {
   val isUpdate: Boolean get() = original != null
+  val obsoleteRecords: List<SavedLine> get() = records.filter { it.obsolete }
 }

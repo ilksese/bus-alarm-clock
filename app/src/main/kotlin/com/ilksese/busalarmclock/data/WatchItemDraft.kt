@@ -13,6 +13,9 @@ data class SelectedLine(
   val identity: String get() = "$lineNo|$upDown|$targetSequence"
 }
 
+/** 线路方向身份：同线路同方向即同一乘车选项，站序变化只更新显示，不算过时。 */
+val SelectedLine.direction: String get() = "$lineNo|$upDown"
+
 /** 用户确认保存的具体站台及一条或多条可替代线路方向。 */
 data class WatchItemDraft(
   val stopCode: String,
