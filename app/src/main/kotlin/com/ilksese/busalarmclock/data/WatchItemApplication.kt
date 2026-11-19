@@ -48,6 +48,9 @@ class WatchItemApplication(
       }
       // 已经解释过的结束记录不再保留；仍在运行的记录保留到下次，直到有新任务覆盖。
       if (last?.endedReason != null) withContext(Dispatchers.IO) { tasks.clear() }
+      // 上次被系统杀死时进程内来不及清理，状态栏可能残留那条常驻通知；重开时按同一 id 撤下。
+      // 只在本进程没有任何在跑的一轮时才撤，避免重建页面把正在监测的通知误删。
+      else if (last != null && session == null) platform.dismiss()
     } catch (error: Exception) {
       if (error is CancellationException) throw error
       mutableState.update { it.copy(message = "本机关注项读取失败，请重试；不会清除数据") }
@@ -308,10 +311,24 @@ class WatchItemApplication(
     session = null
     if (running != null) running.cancel()
     else mutableState.update { it.copy(wait = it.wait.copy(running = false, endedReason = WaitEndReason.CANCELLED, message = WaitEndReason.CANCELLED.message)) }
+    // 结束即撤下常驻通知：状态栏不能留一条点不动的"正在监测"。
+    platform.dismiss()
   }
 
   fun imageFailure(message: String) {
     mutableState.update { it.copy(message = message, adding = true) }
+  }
+
+  /**
+   * 前台服务在进程内判定失败（例如系统拒绝前台提升）时结束同一轮等车。
+   * 只结束仍在运行的那一轮；已结束的轮次不被旧回调改写。
+   */
+  suspend fun failWait(reason: WaitEndReason) {
+    val running = session
+    session = null
+    if (running != null) running.terminate()
+    else mutableState.update { it.copy(wait = it.wait.copy(running = false, endedReason = reason, message = reason.message)) }
+    platform.dismiss()
   }
 
   suspend fun decoded(rawValues: List<String>) {
