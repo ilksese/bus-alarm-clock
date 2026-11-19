@@ -69,20 +69,58 @@ class WatchItemsViewModel(application: Application) : AndroidViewModel(applicati
 }
 
 class MainActivity : ComponentActivity() {
+  private var cameraPermissionContinuation: ((Boolean) -> Unit)? = null
+  private val requestCamera = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+    val continuation = cameraPermissionContinuation
+    cameraPermissionContinuation = null
+    continuation?.invoke(granted)
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     enableEdgeToEdge()
     setContent {
       val model: WatchItemsViewModel = viewModel()
-      BusAlarmClockTheme { WatchItemsScreen(model.applicationBehavior, model.viewModelScope) }
+      val context = androidx.compose.ui.platform.LocalContext.current
+      // 仅在用户进入相机扫码时申请 CAMERA；退出取景即释放，不启用相机前台服务。
+      val access = CameraAccess(
+        granted = android.content.pm.PackageManager.PERMISSION_GRANTED ==
+          context.checkSelfPermission(android.Manifest.permission.CAMERA),
+        request = { continuation ->
+          cameraPermissionContinuation = continuation
+          requestCamera.launch(android.Manifest.permission.CAMERA)
+        },
+      )
+      BusAlarmClockTheme {
+        WatchItemsScreen(
+          model.applicationBehavior,
+          model.viewModelScope,
+          cameraAccess = access,
+          viewfinder = { onDecoded -> QrViewfinder(onDecoded) },
+        )
+      }
     }
   }
 }
 
-/** 两主页与同一添加流程；UI 不直接发 HTTP 请求或写 Room。 */
+/** 相机可用性由 Activity 注入；测试可控制授权结果而不触碰真实硬件。 */
+class CameraAccess(val granted: Boolean, val request: ((Boolean) -> Unit) -> Unit = { it(granted) })
+
+/** 进入扫码时可能处于“等待授权”，此时不能预览，也不能假装已在取景。 */
+enum class CameraPhase { GRANTED, PENDING, DENIED }
+
+/**
+ * 两个主页与同一添加流程；UI 不直接发 HTTP 请求或写 Room。
+ * 相机只在添加流程内出现，[viewfinder] 负责真实取景并把识别结果交回同一导入入口。
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.coroutines.CoroutineScope? = null) {
+fun WatchItemsScreen(
+  application: WatchItemApplication,
+  actionScope: kotlinx.coroutines.CoroutineScope? = null,
+  cameraAccess: CameraAccess = CameraAccess(granted = false),
+  viewfinder: (@Composable (onDecoded: (String) -> Boolean) -> Unit)? = null,
+) {
   val state by application.state.collectAsStateWithLifecycle()
   val compositionScope = rememberCoroutineScope()
   val scope = actionScope ?: compositionScope
@@ -90,6 +128,28 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
   var scanning by remember { mutableStateOf(false) }
   var scanGeneration by remember { mutableLongStateOf(0) }
   LaunchedEffect(application) { application.open() }
+
+  // 同步判定是否接管：不受支持的码仍交给应用层给出提示并保留取景，但不占用“一码只交付一次”的机会。
+  fun importCamera(rawValue: String): Boolean {
+    val accepted = application.isCameraCodeAccepted(rawValue)
+    scope.launch { application.cameraDecoded(rawValue) }
+    return accepted
+  }
+
+  var cameraPhase by remember(cameraAccess.granted) {
+    mutableStateOf(if (cameraAccess.granted) CameraPhase.GRANTED else CameraPhase.PENDING)
+  }
+
+  fun startCamera() {
+    application.openCamera()
+    cameraPhase = if (cameraAccess.granted) CameraPhase.GRANTED else CameraPhase.PENDING
+    if (cameraAccess.granted) return
+    cameraAccess.request { granted ->
+      // 拒绝或取消授权都只回到添加面板，相册入口与已有关注项不受影响。
+      cameraPhase = if (granted) CameraPhase.GRANTED else CameraPhase.DENIED
+      if (!granted) application.cameraPermissionDenied()
+    }
+  }
 
   fun scan(uri: Uri) {
     val generation = ++scanGeneration
@@ -116,14 +176,15 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
   val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { it?.let(::scan) }
   val documentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(::scan) }
   fun cancel() { scanGeneration++; scanning = false; application.cancel() }
-  BackHandler(state.adding && !state.saving) { cancel() }
+  fun leaveCamera() { scanGeneration++; scanning = false; application.closeCamera() }
+  BackHandler(state.adding && !state.saving) { if (state.cameraActive) leaveCamera() else cancel() }
 
   Scaffold(
     topBar = {
       TopAppBar(
         title = { Text(if (state.adding) "确认上车站台" else if (state.currentPage) "当前等车" else "关注项") },
         navigationIcon = {
-          if (state.adding) IconButton(enabled = !state.saving, onClick = { cancel() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "取消添加") }
+          if (state.adding) IconButton(enabled = !state.saving, onClick = { if (state.cameraActive) leaveCamera() else cancel() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, if (state.cameraActive) "退出扫码" else "取消添加") }
         },
         actions = {
           if (!state.adding && !state.currentPage) IconButton(onClick = application::showAdd) { Icon(Icons.Default.Add, "添加站台") }
@@ -147,14 +208,31 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
       when {
         state.adding -> {
           val draft = state.confirmation
-          if (draft == null) {
+          if (state.cameraActive) {
             item {
-              Text("从相册识别", style = MaterialTheme.typography.headlineMedium)
-              Text("选择含公交二维码的图片，随后确认具体站台与线路方向。", modifier = Modifier.padding(top = 12.dp))
+              Text("扫描站台二维码", style = MaterialTheme.typography.headlineMedium)
+              Text("将站台二维码放入框内，识别后进入同一站台与线路确认流程。", modifier = Modifier.padding(top = 12.dp))
               Text("不获取定位，不保存扫码照片。", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
             }
-            item { PrimaryAction("从相册选择", enabled = !scanning && !state.loading) { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) } }
-            item { SecondaryAction("选图不可用？从系统文件选择", enabled = !scanning && !state.loading) { documentPicker.launch(arrayOf("image/*")) } }
+            item {
+              when (cameraPhase) {
+                // 只有真正拿到授权才挂载取景；等待授权期间不能显示空画面冒充取景。
+                CameraPhase.GRANTED -> viewfinder?.invoke(::importCamera) ?: Text("当前无法预览相机画面，可从相册选择。")
+                CameraPhase.PENDING -> Text("等待相机授权…授权后自动开始取景；也可以返回改用相册。")
+                CameraPhase.DENIED -> Text("相机未授权，仍可从相册选择。")
+              }
+            }
+            item { Text("识别受支持的公交站台码后自动继续；其他码会被忽略。", style = MaterialTheme.typography.bodySmall) }
+            item { SecondaryAction("取消扫码") { leaveCamera() } }
+          } else if (draft == null) {
+            item {
+              Text("添加上车站台", style = MaterialTheme.typography.headlineMedium)
+              Text("扫描公交站台二维码，随后确认具体站台与线路方向。", modifier = Modifier.padding(top = 12.dp))
+              Text("不获取定位，不保存扫码照片。", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+            }
+            item { PrimaryAction("相机扫码", enabled = !scanning && !state.loading) { startCamera() } }
+            item { SecondaryAction("从相册选择", enabled = !scanning && !state.loading) { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) } }
+            item { TextButton(enabled = !scanning && !state.loading, onClick = { documentPicker.launch(arrayOf("image/*")) }) { Text("从系统文件选择") } }
           } else {
             item {
               Text(draft.station.stationName, style = MaterialTheme.typography.headlineSmall)
