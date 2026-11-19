@@ -139,7 +139,12 @@ fun WatchItemsScreen(
   // 常驻通知的停止入口必须结束同一轮等车，而不是另开一份任务。
   DisposableEffect(application, scope) {
     WaitRuntime.onStop = { scope.launch { application.stopWait() } }
-    onDispose { WaitRuntime.onStop = null }
+    // 服务自己判定失败（前台提升被拒）时，页面结束同一轮并给出可解释的结果。
+    WaitRuntime.onFinish = { scope.launch { application.failWait(it) } }
+    onDispose {
+      WaitRuntime.onStop = null
+      WaitRuntime.onFinish = null
+    }
   }
 
   // 同步判定是否接管：不受支持的码仍交给应用层给出提示并保留取景，但不占用“一码只交付一次”的机会。
