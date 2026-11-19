@@ -47,7 +47,7 @@ class BusSourceClient(
   /** 与 resolveLines 共用同一请求身份，选线核对与等车刷新共享节流、在途请求和原始获取时间。 */
   suspend fun observeStop(stopCode: String): SourceSnapshot<StopLineSnapshot> {
     val snapshot = get("/bus/station/detail/stop_line", "stopCode", stopCode)
-    return SourceSnapshot(parseStopLine(snapshot.value, stopCode), snapshot.fetchedAt, snapshot.nextAllowedAt)
+    return SourceSnapshot(parseStopLine(snapshot.value, stopCode), snapshot.fetchedAt, snapshot.nextAllowedAt, snapshot.fromCache)
   }
 
   private fun parseStopLine(data: JsonElement, stopCode: String): StopLineSnapshot {
@@ -76,7 +76,7 @@ class BusSourceClient(
     if (seconds < 0) return null
     val stops = vehicle["stationNum"]?.jsonPrimitive?.intOrNull
     // 来源按秒返回剩余时间，页面按整数分钟展示；不足一分钟按 0 分钟处理，不虚构精度。
-    return LineArrival((seconds / 60L).toInt(), stops, stops == 0)
+    return LineArrival(seconds, stops, stops == 0)
   }
 
   private suspend fun get(path: String, parameter: String, value: String): SourceSnapshot<JsonElement> {
@@ -92,9 +92,9 @@ class BusSourceClient(
           val status = connection.responseCode
           val retryAfter = retryAfterMillis(connection.getHeaderField("Retry-After"))
           // 认证失败/拒绝/服务终止不能靠重试解决，由调用方直接结束监测。
-          if (status in 400..403 || status == 419) throw SourceFailure("公交来源拒绝访问（HTTP $status）", clock() + retryAfter, SourceFailureKind.AUTH)
-          if (status == 410) throw SourceFailure("公交来源服务已终止（HTTP $status）", clock() + retryAfter, SourceFailureKind.TERMINATED)
-          if (status !in 200..299) throw SourceFailure("公交来源 HTTP $status", clock() + retryAfter)
+          if (status in 400..403 || status == 419) throw SourceFailure("公交来源拒绝访问（HTTP $status）", clock().plusDelay(retryAfter), SourceFailureKind.AUTH)
+          if (status == 410) throw SourceFailure("公交来源服务已终止（HTTP $status）", clock().plusDelay(retryAfter), SourceFailureKind.TERMINATED)
+          if (status !in 200..299) throw SourceFailure("公交来源 HTTP $status", clock().plusDelay(retryAfter))
           val body = connection.inputStream.bufferedReader().use { it.readText() }
           // HTTP 成功不代表业务成功；业务失败和解析失败同样必须计入请求间隔。
           val envelope = Json.parseToJsonElement(body).jsonObject
@@ -105,7 +105,7 @@ class BusSourceClient(
               410 -> SourceFailureKind.TERMINATED
               else -> SourceFailureKind.TRANSIENT
             }
-            throw SourceFailure("公交来源业务失败", clock() + retryAfter, kind)
+            throw SourceFailure("公交来源业务失败", clock().plusDelay(retryAfter), kind)
           }
           check(envelope["data"] != null && envelope["data"] != kotlinx.serialization.json.JsonNull) { "来源数据缺失" }
           HttpPayload(body, retryAfter)
@@ -114,14 +114,19 @@ class BusSourceClient(
         }
       }
     }
-    return SourceSnapshot(Json.parseToJsonElement(snapshot.value).jsonObject.getValue("data"), snapshot.fetchedAt, snapshot.nextAllowedAt)
+    return SourceSnapshot(Json.parseToJsonElement(snapshot.value).jsonObject.getValue("data"), snapshot.fetchedAt, snapshot.nextAllowedAt, snapshot.fromCache)
   }
 
   private fun retryAfterMillis(value: String?): Long {
-    val seconds = value?.trim()?.toLongOrNull()
-    if (seconds != null) return seconds.coerceIn(0, Long.MAX_VALUE / 1000) * 1000
+    val header = value?.trim() ?: return 0
+    val digits = if (header.startsWith('+') || header.startsWith('-')) header.drop(1) else header
+    if (digits.isNotEmpty() && digits.all { it in '0'..'9' }) {
+      if (header.startsWith('-')) return 0
+      val seconds = digits.trimStart('0').ifEmpty { "0" }.toLongOrNull() ?: return Long.MAX_VALUE
+      return if (seconds > Long.MAX_VALUE / 1_000L) Long.MAX_VALUE else seconds * 1_000L
+    }
     return runCatching {
-      (ZonedDateTime.parse(value, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli() - clock()).coerceAtLeast(0)
+      clock().delayUntil(ZonedDateTime.parse(header, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli())
     }.getOrDefault(0)
   }
 }
@@ -130,7 +135,9 @@ data class StationStop(val stopCode: String, val stationName: String)
 data class StationChoice(val stationName: String, val defaultStopCode: String, val stops: List<StationStop>, val fetchedAt: Long)
 
 /** 一条线路在本次查询站台的预测；absence 表示来源没有给出该线路的可用车辆。 */
-data class LineArrival(val minutes: Int, val stops: Int?, val arriving: Boolean)
+data class LineArrival(val seconds: Long, val stops: Int?, val arriving: Boolean) {
+  val minutes: Int get() = (seconds / 60L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+}
 
 /** 同一份站台响应同时给出线路清单与各线路到本次站台的预测，避免两次请求读出不一致。 */
 data class StopLineSnapshot(

@@ -5,12 +5,14 @@
     <!-- 仅在用户进入相机扫码时申请；相册导入不需要相机权限。 -->
     <uses-permission android:name="android.permission.CAMERA" />
 
-    <!-- 仅用于线路过时/恢复的安静文字通知；未授权时跳过通知，不影响关注项数据。 -->
+    <!-- 用于等车状态、出门提醒、线路状态；开始监测前请求，未授权不影响关注项。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- 等车期间的前台数据同步服务；启动时申请通知授权，撤销后仍继续监测。 -->
+    <!-- 等车取数期间使用 dataSync；不从后台重启已结束的监测。 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 播放器就绪且取得焦点后换为 mediaPlayback，切换成功才播放，不并用两种类型。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
@@ -33,10 +35,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <receiver android:name=".wait.WaitNotificationReceiver" android:exported="false" />
         <service
             android:name=".wait.WaitService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|mediaPlayback" />
     </application>
 
 </manifest>

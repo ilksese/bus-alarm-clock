@@ -62,7 +62,7 @@ interface WatchItemDao {
   suspend fun delete(stopCode: String)
 }
 
-@Database(entities = [WatchItemEntity::class, WaitTaskEntity::class], version = 4, exportSchema = false)
+@Database(entities = [WatchItemEntity::class, WaitTaskEntity::class, OutingAlertEntity::class], version = 7, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
   abstract fun watchItemDao(): WatchItemDao
   abstract fun waitTaskDao(): WaitTaskDao

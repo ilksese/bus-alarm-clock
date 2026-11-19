@@ -6,8 +6,8 @@ import kotlinx.serialization.json.Json
 
 /**
  * 建最少任务状态表的主体，供迁移复用。
- * 单独抽出是因为 #18 也会占用 v3；合并时只需新增 `MIGRATION_3_4` 调用本函数，
- * 不必复制建表语句，也不用改动这里的列定义。
+ * 这里固定是 v4 时的表结构（不含 #20 的提醒列）：v3→v4 与 v4→v5 串起来时，
+ * 提醒列只会在 v4→v5 里 ALTER 一次，重复加列会让升级直接失败。
  */
 internal fun createWaitTasksTable(database: SupportSQLiteDatabase) {
   database.execSQL(
@@ -38,6 +38,32 @@ internal fun createWaitTasksTable(database: SupportSQLiteDatabase) {
  */
 val MIGRATION_3_4 = object : Migration(3, 4) {
   override fun migrate(database: SupportSQLiteDatabase) = createWaitTasksTable(database)
+}
+
+/**
+ * #20 在等车记录上补两列：已触发事实与提醒快照、是否已确认。
+ * 非破坏性：旧记录保留，新列对旧数据为空/未确认。
+ */
+val MIGRATION_4_5 = object : Migration(4, 5) {
+  override fun migrate(database: SupportSQLiteDatabase) {
+    database.execSQL("ALTER TABLE wait_tasks ADD COLUMN alertJson TEXT DEFAULT NULL")
+    database.execSQL("ALTER TABLE wait_tasks ADD COLUMN alertConfirmed INTEGER NOT NULL DEFAULT 0")
+  }
+}
+
+/** 保留 v5 当前任务上的提醒，并让后续各轮的快照按任务身份独立保存。 */
+val MIGRATION_5_6 = object : Migration(5, 6) {
+  override fun migrate(db: SupportSQLiteDatabase) {
+    db.execSQL("CREATE TABLE outing_alerts (taskId INTEGER NOT NULL PRIMARY KEY, snapshotJson TEXT NOT NULL, confirmed INTEGER NOT NULL)")
+    db.execSQL("INSERT INTO outing_alerts SELECT id, alertJson, alertConfirmed FROM wait_tasks WHERE alertJson IS NOT NULL")
+  }
+}
+
+/** 既有提醒仍可查看；新快照只有记录提交后才进入提醒列表。 */
+val MIGRATION_6_7 = object : Migration(6, 7) {
+  override fun migrate(db: SupportSQLiteDatabase) {
+    db.execSQL("ALTER TABLE outing_alerts ADD COLUMN submitted INTEGER NOT NULL DEFAULT 1")
+  }
 }
 
 val MIGRATION_1_2 = object : Migration(1, 2) {

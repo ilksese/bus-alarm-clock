@@ -1,7 +1,10 @@
 package com.ilksese.busalarmclock
 
-import android.app.Application
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.provider.Settings
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -48,36 +51,23 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
-import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.lifecycleScope
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import com.ilksese.busalarmclock.data.*
 import com.ilksese.busalarmclock.ui.theme.BusAlarmClockTheme
-import com.ilksese.busalarmclock.wait.AndroidWaitPlatform
+import com.ilksese.busalarmclock.wait.WaitNotifications
 import com.ilksese.busalarmclock.wait.WaitRuntime
 import java.text.DateFormat
 import java.util.Date
 import kotlinx.coroutines.launch
 
-/** 配置变化复用同一行为入口与请求状态，不因重建 Activity 绕过请求间隔。 */
-class WatchItemsViewModel(application: Application) : AndroidViewModel(application) {
-  private val database = DatabaseProvider.create(application)
-  val applicationBehavior = WatchItemApplication(
-    BusSourceClient(),
-    RoomWatchItemStore(database),
-    AndroidWaitPlatform(application),
-    tasks = RoomWaitTaskStore(database),
-    notifier = QuietLineStatusNotifier(application),
-  )
-  override fun onCleared() { database.close() }
-}
-
 class MainActivity : ComponentActivity() {
   private var cameraPermissionContinuation: ((Boolean) -> Unit)? = null
+  /** 从提醒通知正文进来时要查看的那条提醒；只用于定位，不构成确认。 */
+  private val pendingAlertTask = mutableStateOf<AlertOpenRequest?>(null)
   private val requestCamera = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
     val continuation = cameraPermissionContinuation
     cameraPermissionContinuation = null
@@ -87,8 +77,9 @@ class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     enableEdgeToEdge()
+    pendingAlertTask.value = alertRequestOf(intent)
     setContent {
-      val model: WatchItemsViewModel = viewModel()
+      val applicationBehavior = WaitRuntime.application(this)
       val context = androidx.compose.ui.platform.LocalContext.current
       // 仅在用户进入相机扫码时申请 CAMERA；退出取景即释放，不启用相机前台服务。
       val access = CameraAccess(
@@ -101,15 +92,32 @@ class MainActivity : ComponentActivity() {
       )
       BusAlarmClockTheme {
         WatchItemsScreen(
-          model.applicationBehavior,
-          model.viewModelScope,
+          applicationBehavior,
+          actionScope = lifecycleScope,
+          waitActionScope = WaitRuntime.scope,
           cameraAccess = access,
           viewfinder = { onDecoded -> QrViewfinder(onDecoded) },
+          alertOpenRequest = pendingAlertTask.value,
         )
       }
     }
   }
+
+  /** 页面已在后台时点通知正文：同样只定位查看，不确认、不停止输出。 */
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    setIntent(intent)
+    pendingAlertTask.value = alertRequestOf(intent)
+  }
+
+  private fun alertRequestOf(intent: Intent?): AlertOpenRequest? = intent?.let {
+    if (it.action == WaitNotifications.OPEN_ALERT_LIST) AlertOpenRequest(null)
+    else WaitNotifications.taskOf(it, WaitNotifications.OPEN_ALERT)?.let(::AlertOpenRequest)
+  }
 }
+
+/** 一次通知正文点击；同一条通知再次点开也会产生一个新请求。 */
+class AlertOpenRequest(val taskId: Long?)
 
 /** 相机可用性由 Activity 注入；测试可控制授权结果而不触碰真实硬件。 */
 class CameraAccess(val granted: Boolean, val request: ((Boolean) -> Unit) -> Unit = { it(granted) })
@@ -128,25 +136,53 @@ fun WatchItemsScreen(
   actionScope: kotlinx.coroutines.CoroutineScope? = null,
   cameraAccess: CameraAccess = CameraAccess(granted = false),
   viewfinder: (@Composable (onDecoded: (String) -> Boolean) -> Unit)? = null,
+  alertOpenRequest: AlertOpenRequest? = null,
+  waitActionScope: kotlinx.coroutines.CoroutineScope? = null,
+  notificationPermissionRequest: (((Boolean) -> Unit) -> Unit)? = null,
 ) {
   val state by application.state.collectAsStateWithLifecycle()
   val compositionScope = rememberCoroutineScope()
   val scope = actionScope ?: compositionScope
+  val waitScope = waitActionScope ?: scope
   val context = androidx.compose.ui.platform.LocalContext.current
   var scanning by remember { mutableStateOf(false) }
   var scanGeneration by remember { mutableLongStateOf(0) }
+  // 当前正在查看的提醒；null 表示跟随最新一条。
+  var viewingAlertTask by remember { mutableStateOf<Long?>(null) }
+  var viewingAlertList by remember { mutableStateOf(false) }
   LaunchedEffect(application) { application.open() }
-  // 常驻通知的停止入口必须结束同一轮等车，而不是另开一份任务。
-  DisposableEffect(application, scope) {
-    WaitRuntime.onStop = { scope.launch { application.stopWait() } }
-    // 服务自己判定失败（前台提升被拒）时，页面结束同一轮并给出可解释的结果。
-    WaitRuntime.onFinish = { scope.launch { application.failWait(it) } }
-    onDispose {
-      WaitRuntime.onStop = null
-      WaitRuntime.onFinish = null
+  val incomingAlert = alertOpenRequest?.taskId
+  val alertAvailable = state.wait.alerts.any { it.snapshot.taskId == incomingAlert }
+  LaunchedEffect(alertOpenRequest, alertAvailable) {
+    if (alertOpenRequest != null && incomingAlert == null) {
+      application.showCurrent(true)
+      viewingAlertTask = null
+      viewingAlertList = true
+    } else if (incomingAlert != null && alertAvailable && application.viewAlert(incomingAlert)) {
+      viewingAlertTask = incomingAlert
+      viewingAlertList = false
     }
   }
-
+  val hasNotificationPermission = {
+    context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+  }
+  var permissionPending by remember { mutableStateOf(false) }
+  val permissionResult: (Boolean) -> Unit = { granted ->
+    permissionPending = false
+    if (granted) waitScope.launch { application.startWait() }
+    else application.notificationPermissionDenied()
+  }
+  val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission(), permissionResult)
+  val startMonitoring = {
+    if (hasNotificationPermission()) {
+      waitScope.launch { application.startWait() }
+    } else if (!permissionPending) {
+      permissionPending = true
+      if (notificationPermissionRequest != null) notificationPermissionRequest(permissionResult)
+      else notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+    Unit
+  }
   // 同步判定是否接管：不受支持的码仍交给应用层给出提示并保留取景，但不占用“一码只交付一次”的机会。
   fun importCamera(rawValue: String): Boolean {
     val accepted = application.isCameraCodeAccepted(rawValue)
@@ -195,6 +231,8 @@ fun WatchItemsScreen(
   val documentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(::scan) }
   fun cancel() { scanGeneration++; scanning = false; application.cancel() }
   fun leaveCamera() { scanGeneration++; scanning = false; application.closeCamera() }
+  BackHandler(viewingAlertList && state.currentPage && !state.adding) { viewingAlertList = false; viewingAlertTask = null }
+  BackHandler(viewingAlertTask != null && state.currentPage && !state.adding) { viewingAlertTask = null }
   BackHandler(state.adding && !state.saving) { if (state.cameraActive) leaveCamera() else cancel() }
 
   Scaffold(
@@ -213,8 +251,8 @@ fun WatchItemsScreen(
       if (!state.adding) {
         // D 原型底部导航：选中项是浅柠色胶囊 + 深石蓝图标，未选中为次文色。
         Row(Modifier.fillMaxWidth().background(DeepBlue).padding(vertical = 7.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-          DNavigationItem("关注项", Icons.Default.Place, selected = !state.currentPage) { application.showCurrent(false) }
-          DNavigationItem("当前等车", Icons.Default.Schedule, selected = state.currentPage) { application.showCurrent(true) }
+          DNavigationItem("关注项", Icons.Default.Place, selected = !state.currentPage) { viewingAlertList = false; viewingAlertTask = null; application.showCurrent(false) }
+          DNavigationItem("当前等车", Icons.Default.Schedule, selected = state.currentPage) { viewingAlertList = false; viewingAlertTask = null; application.showCurrent(true) }
         }
       }
     },
@@ -316,19 +354,52 @@ fun WatchItemsScreen(
         }
         state.currentPage -> {
           val preflight = state.preflight
+          val listed = state.wait.alerts
+          val viewingAlert = listed.firstOrNull { it.snapshot.taskId == viewingAlertTask }
+          val currentFailure = state.wait.endedReason?.takeIf {
+            it != WaitEndReason.ALERTED && it != WaitEndReason.ALERT_CONFIRMED
+          }
+          val ownAlert = listed.firstOrNull { it.snapshot.taskId == state.wait.taskId }
+          // 当前故障不被历史提醒遮挡；用户仍可明确点进未确认快照。
+          val alert = viewingAlert ?: if (!viewingAlertList && currentFailure == null && preflight == null) {
+            ownAlert ?: listed.firstOrNull { !it.confirmed }?.takeIf { !state.wait.running }
+          } else null
           item {
             Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
-              if (preflight != null) {
-                WaitPreflightPanel(preflight, scope, application)
-              } else if (state.wait.stopCode != null) {
-                WaitingPanel(state.wait, scope, application)
-              } else {
-                EmptyState("还没开始等车", "去关注项，选一个具体站台开始。")
-                SecondaryAction("去关注项") { application.showCurrent(false) }
+              when {
+                alert != null -> AlertPanel(alert, waitScope, application, showBack = viewingAlert != null) { viewingAlertTask = null }
+                viewingAlertList -> {
+                  Text("未确认提醒", style = MaterialTheme.typography.headlineSmall)
+                  if (listed.none { !it.confirmed }) Text("没有未确认的出门提醒")
+                  TextButton(onClick = { viewingAlertList = false }) { Text("返回当前等车") }
+                }
+                preflight != null -> WaitPreflightPanel(
+                  preflight, application, permissionPending, startMonitoring,
+                  onNotificationSettings = {
+                    context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
+                  },
+                )
+                currentFailure != null -> EmptyState("本次等车已结束", state.wait.message ?: currentFailure.message)
+                state.wait.stopCode != null -> WaitingPanel(state.wait, waitScope, application)
+                else -> {
+                  EmptyState("还没开始等车", "去关注项，选一个具体站台开始。")
+                  SecondaryAction("去关注项") { application.showCurrent(false) }
+                }
               }
               val endedMessage = state.wait.message
-              if (state.wait.endedReason != null && endedMessage != null && !state.wait.running) {
+              if (!viewingAlertList && alert == null && currentFailure == null && state.wait.endedReason != null && endedMessage != null && !state.wait.running) {
                 Text(endedMessage, color = SubText, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
+              }
+            }
+          }
+          val otherPending = listed.filter { !it.confirmed && it.snapshot.taskId != alert?.snapshot?.taskId }
+          if ((viewingAlertList || preflight == null) && otherPending.isNotEmpty()) {
+            if (!viewingAlertList) item { Text("其他未确认的出门提醒", style = MaterialTheme.typography.titleMedium) }
+            otherPending.forEach { pending ->
+              item(key = "alert-${pending.snapshot.taskId}") {
+                TextButton(onClick = { viewingAlertTask = pending.snapshot.taskId }) {
+                  Text("查看 ${pending.snapshot.main.lineName} 的提醒 · ${pending.snapshot.stationName}")
+                }
               }
             }
           }
@@ -362,7 +433,7 @@ fun WatchItemsScreen(
                   color = SubText,
                 )
                 Button(
-                  onClick = { application.prepareWait(item.stopCode) },
+                  onClick = { viewingAlertList = false; viewingAlertTask = null; application.prepareWait(item.stopCode) },
                   enabled = !state.wait.running,
                   shape = RoundedCornerShape(17.dp),
                   contentPadding = PaddingValues(vertical = 12.dp, horizontal = 16.dp),
@@ -398,12 +469,101 @@ fun WatchItemsScreen(
   }
 }
 
+/** D 的 C 独立提醒面：已触发事实、触发时预计与同窗口线路；只有一个明确的确认动作。 */
+@Composable
+private fun AlertPanel(
+  alert: OutingAlert,
+  scope: kotlinx.coroutines.CoroutineScope,
+  application: WatchItemApplication,
+  showBack: Boolean,
+  onBack: () -> Unit,
+) {
+  val snapshot = alert.snapshot
+  Row(verticalAlignment = Alignment.CenterVertically) {
+    Box(Modifier.size(8.dp).background(Accent, CircleShape))
+    Spacer(Modifier.width(8.dp))
+    // 触发即停止取数：这一行是已触发事实，不随新预测变化。
+    Text("出门提醒 · 已触发 · 取数已停止", style = MaterialTheme.typography.labelLarge, color = Accent)
+  }
+  Spacer(Modifier.size(18.dp))
+  Column(Modifier.fillMaxWidth().background(SoftSurface, RoundedCornerShape(22.dp)).padding(20.dp)) {
+    Text(
+      when {
+        alert.confirmed -> "提醒已确认"
+        !alert.outputEnded -> "准备出门吧"
+        else -> "提醒已结束输出"
+      },
+      style = MaterialTheme.typography.headlineSmall,
+      color = BodyText,
+    )
+    Text(
+      when {
+        alert.confirmed -> "本次输出已停止"
+        !alert.outputEnded -> "你的车进入提醒窗口了"
+        else -> "尚未确认 · 不会自动重响"
+      },
+      style = MaterialTheme.typography.bodySmall,
+      color = SubText,
+      modifier = Modifier.padding(top = 6.dp),
+    )
+    Spacer(Modifier.size(18.dp))
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+      Row(verticalAlignment = Alignment.Bottom) {
+        Text((snapshot.main.etaSeconds / 60L).toString(), style = MaterialTheme.typography.displayLarge, color = BodyText)
+        Spacer(Modifier.width(4.dp))
+        val seconds = snapshot.main.etaSeconds % 60
+        Text(if (seconds == 0L) "分钟" else "分 $seconds 秒", style = MaterialTheme.typography.bodySmall, color = SubText, modifier = Modifier.padding(bottom = 10.dp))
+      }
+      Spacer(Modifier.weight(1f))
+      Text("触发时预计\n不继续倒计时", style = MaterialTheme.typography.bodySmall, color = SubText)
+    }
+    Spacer(Modifier.size(14.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+      RouteTag(snapshot.main.lineName)
+      Spacer(Modifier.width(11.dp))
+      Column {
+        Text("开往${snapshot.main.endStationName}", style = MaterialTheme.typography.bodyMedium, color = BodyText)
+        Text("${snapshot.stationName} · 站台 ${snapshot.stopCode}", style = MaterialTheme.typography.bodySmall, color = SubText)
+      }
+    }
+    if (snapshot.others.isNotEmpty()) {
+      HorizontalDivider(color = Hairline, modifier = Modifier.padding(vertical = 14.dp))
+      Text(
+        "同时在窗口内：" + snapshot.others.joinToString("、") { "${it.lineName} · 约 ${formatAlertEta(it.etaSeconds)}" },
+        style = MaterialTheme.typography.bodySmall,
+        color = SubText,
+      )
+    }
+    HorizontalDivider(color = Hairline, modifier = Modifier.padding(vertical = 14.dp))
+    Text(
+      "本次预测获取时间：${DateFormat.getDateTimeInstance().format(Date(snapshot.fetchedAt))}",
+      style = MaterialTheme.typography.bodySmall,
+      color = SubText,
+    )
+  }
+  Spacer(Modifier.size(16.dp))
+  if (alert.submissionPending) Text("通知已提交，本机提交状态未能保存；不代表系统已展示。", color = SubText)
+  if (alert.confirmationError) Text("输出已停止，但确认未能保存；请重试。", color = MaterialTheme.colorScheme.error)
+  if (!alert.confirmed) {
+    PrimaryAction("知道了，停止提醒") { scope.launch { application.confirmAlert(snapshot.taskId) } }
+  }
+  if (showBack) TextButton(onClick = onBack) { Text("返回") }
+  Text(
+    if (alert.confirmed) "已确认，本次已经结束；不会自动重响。"
+    else "提示音和震动最多各一次，受系统设置限制；未确认的提醒仍可查看。",
+    style = MaterialTheme.typography.bodySmall,
+    color = SubText,
+  )
+}
+
 /** 开始前同屏核对：站台线路、步行时间 W 与预留余量 B；不自动估算 W。 */
 @Composable
 private fun WaitPreflightPanel(
   draft: WaitPreflight,
-  scope: kotlinx.coroutines.CoroutineScope,
   application: WatchItemApplication,
+  permissionPending: Boolean,
+  onStart: () -> Unit,
+  onNotificationSettings: () -> Unit,
 ) {
   Text(draft.stationName, style = MaterialTheme.typography.headlineSmall, color = BodyText)
   Text("站台 ${draft.stopCode}", style = MaterialTheme.typography.bodySmall, color = SubText)
@@ -454,17 +614,20 @@ private fun WaitPreflightPanel(
     )
   }
   draft.error?.let { Text(it, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 12.dp)) }
+  if (draft.notificationBlocked) TextButton(onClick = onNotificationSettings) { Text("打开通知设置") }
   Spacer(Modifier.size(16.dp))
   PrimaryAction(
     when {
+      permissionPending -> "等待通知授权…"
       draft.starting -> "正在开始…"
       draft.verifying -> "正在核对站台与线路…"
       else -> "开始监测"
     },
-    enabled = !draft.starting && !draft.verifying,
-  ) { scope.launch { application.startWait() } }
-  TextButton(enabled = !draft.starting && !draft.verifying, onClick = application::dismissPreflight) { Text("取消") }
-  Text("开始前会先联网核对站台与线路；核对失败不会离线开始。", style = MaterialTheme.typography.bodySmall, color = SubText)
+    enabled = !draft.starting && !draft.verifying && !permissionPending,
+    onClick = onStart,
+  )
+  TextButton(enabled = !draft.starting && !draft.verifying && !permissionPending, onClick = application::dismissPreflight) { Text("取消") }
+  Text("等车提醒需要通知权限；开始前会联网核对站台与线路。", style = MaterialTheme.typography.bodySmall, color = SubText)
   Text("本次最多监测 30 分钟；连续 5 分钟没有成功响应会自动结束。", style = MaterialTheme.typography.bodySmall, color = SubText)
 }
 

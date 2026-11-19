@@ -3,12 +3,14 @@ package com.ilksese.busalarmclock.data
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 
@@ -21,8 +23,11 @@ class WatchItemApplication(
   private val tasks: WaitTaskStore,
   private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
   private val sleeper: suspend (Long) -> Unit = { delay(it) },
+  private val submissionSleeper: suspend (Long) -> Unit = { delay(it) },
+  private val elapsedClock: () -> Long = { System.nanoTime() / 1_000_000L },
   /** 线路过时/恢复的安静通知；默认不通知，测试与生产各自注入。 */
   private val notifier: LineStatusNotifier = LineStatusNotifier { },
+  private val requestDeadlineSleeper: suspend (Long) -> Unit = { delay(it) },
 ) {
   private val mutableState = MutableStateFlow(WatchItemsState())
   val state = mutableState.asStateFlow()
@@ -32,25 +37,43 @@ class WatchItemApplication(
 
   suspend fun open() {
     try {
-      val items = withContext(Dispatchers.IO) { store.all() }
-      val last = withContext(Dispatchers.IO) { tasks.load() }
-      mutableState.update {
-        it.copy(
-          items = items,
-          // 重开只解释上次发生了什么；不自动恢复、不补发提醒。
-          wait = when {
-            last == null -> it.wait
-            last.endedReason == WaitEndReason.CANCELLED -> WaitState(stopCode = last.stopCode, endedReason = WaitEndReason.CANCELLED, message = "上次等车已主动取消。")
-            last.endedReason != null -> WaitState(stopCode = last.stopCode, endedReason = last.endedReason, message = last.endedReason.message)
-            else -> WaitState(stopCode = last.stopCode, endedReason = WaitEndReason.INTERRUPTED, message = WaitEndReason.INTERRUPTED.message)
-          },
-        )
+      val openingItems = state.value.items
+      val liveTaskId = session?.current()?.takeIf { it.running }?.taskId
+      val (items, last, savedAlerts) = withContext(Dispatchers.IO) {
+        val items = store.all()
+        val last = tasks.load()
+        val posted = platform.postedAlertIds() - setOfNotNull(liveTaskId)
+        val saved = if (posted.isEmpty()) tasks.alerts() else tasks.alertsWithPosted(posted)
+        Triple(items, last, saved)
       }
-      // 已经解释过的结束记录不再保留；仍在运行的记录保留到下次，直到有新任务覆盖。
-      if (last?.endedReason != null) withContext(Dispatchers.IO) { tasks.clear() }
-      // 上次被系统杀死时进程内来不及清理，状态栏可能残留那条常驻通知；重开时按同一 id 撤下。
-      // 只在本进程没有任何在跑的一轮时才撤，避免重建页面把正在监测的通知误删。
-      else if (last != null && session == null) platform.dismiss()
+      taskIds.accumulateAndGet(maxOf(last?.id ?: 0L, savedAlerts.maxOfOrNull { it.snapshot.taskId } ?: 0L), { id, saved -> maxOf(id, saved) })
+      mutableState.update { current ->
+        val wait = if (liveTaskId != null || session != null || last == null) current.wait else {
+          // 重开只展示已保存的结果，不恢复监测或补发提醒。
+          val reason = when {
+            last.endedReason != null && last.endedReason != WaitEndReason.ALERTED && last.endedReason != WaitEndReason.ALERT_CONFIRMED -> last.endedReason
+            last.alertConfirmed || savedAlerts.any { it.snapshot.taskId == last.id && it.confirmed } -> WaitEndReason.ALERT_CONFIRMED
+            last.alert != null || savedAlerts.any { it.snapshot.taskId == last.id } -> WaitEndReason.ALERTED
+            last.endedReason != null -> last.endedReason
+            clock() >= last.deadlineAt -> WaitEndReason.MAX_DURATION
+            clock() >= (last.lastSuccessAt ?: last.startedAt).plusDelay(MAX_SILENCE) -> WaitEndReason.NO_SUCCESS
+            else -> WaitEndReason.INTERRUPTED
+          }
+          WaitState(taskId = last.id, stopCode = last.stopCode, stationName = last.stationName, endedReason = reason, message = reason.message)
+        }
+        val liveId = session?.current()?.takeIf { it.running }?.taskId
+        val restored = savedAlerts.filterNot { it.snapshot.taskId == liveTaskId || it.snapshot.taskId == liveId }
+        val known = mergeAlerts(restored, current.wait.alerts).map { alert ->
+          if (savedAlerts.any { it.snapshot.taskId == alert.snapshot.taskId && it.confirmed }) {
+            alert.copy(confirmed = true, outputEnded = true)
+          } else alert
+        }
+        current.copy(items = if (current.saving || current.items !== openingItems) current.items else items, wait = wait.copy(alerts = known))
+      }
+      if (liveTaskId == null && session == null && last != null) {
+        if (last.endedReason != null) withContext(Dispatchers.IO) { tasks.clear(last.id) }
+        else platform.dismiss()
+      }
     } catch (error: Exception) {
       if (error is CancellationException) throw error
       mutableState.update { it.copy(message = "本机关注项读取失败，请重试；不会清除数据") }
@@ -79,6 +102,8 @@ class WatchItemApplication(
       loadStop(station, item.stopCode, token, restoreOriginal = true)
     } catch (error: Exception) {
       handleFailure(token, error)
+    } finally {
+      finishLoading(token)
     }
   }
 
@@ -151,7 +176,7 @@ class WatchItemApplication(
         currentPage = true,
         adding = false,
         confirmation = null,
-        wait = WaitState(stopCode = item.stopCode, stationName = item.stationName, walkMinutes = item.walkMinutes, bufferMinutes = item.bufferMinutes),
+        wait = WaitState(stopCode = item.stopCode, stationName = item.stationName, walkMinutes = item.walkMinutes, bufferMinutes = item.bufferMinutes, alerts = it.wait.alerts),
         preflight = WaitPreflight(
           stopCode = item.stopCode,
           stationName = item.stationName,
@@ -177,40 +202,53 @@ class WatchItemApplication(
     mutableState.update { it.copy(preflight = null) }
   }
 
+  fun notificationPermissionDenied() {
+    mutableState.update { state ->
+      state.copy(preflight = state.preflight?.copy(notificationBlocked = true, error = "通知未获授权，未开始监测。请在系统设置允许通知后重试。"))
+    }
+  }
+
   /** 开始前的联网核对：允许复用 60 秒内成功结果，但始终展示原始获取时间。 */
-  suspend fun verifyWait() {
-    val draft = state.value.preflight ?: return
-    if (draft.verifying || draft.starting) return
-    mutableState.update { it.copy(preflight = draft.copy(verifying = true, error = null)) }
+  suspend fun verifyWait() { verifyWait(state.value.preflight ?: return) }
+
+  private suspend fun verifyWait(draft: WaitPreflight): WaitPreflight? {
+    if (draft.verifying || draft.starting) return null
+    val verification = Any()
+    val checking = state.value
+    if (checking.preflight !== draft || !mutableState.compareAndSet(checking,
+        checking.copy(preflight = draft.copy(verifying = true, error = null, verifiedAt = null, verification = verification)))) return null
     try {
       val snapshot = source.observeStop(draft.stopCode)
-      val available = snapshot.value.lines.map { it.identity }.toSet()
-      mutableState.update { state ->
-        val current = state.preflight ?: return@update state
-        val missing = current.lines.none { line -> line.identity in available }
+      val available = snapshot.value.lines.map { it.direction }.toSet()
+      val verified = mutableState.updateAndGet { state ->
+        val current = state.preflight?.takeIf { it.verification === verification } ?: return@updateAndGet state
+        val missing = current.lines.none { line -> !line.obsolete && line.direction in available }
         state.copy(
           preflight = current.copy(
             verifying = false,
-            verifiedAt = snapshot.fetchedAt,
+            verifiedAt = snapshot.fetchedAt.takeUnless { missing },
             error = if (missing) "该站台已没有你选择的线路，请先回到关注项重新选线" else null,
           ),
         )
-      }
+      }.preflight
+      return verified?.takeIf { it.verification === verification && it.verifiedAt != null }
     } catch (error: Exception) {
-      if (error is CancellationException) throw error
       mutableState.update { state ->
-        val current = state.preflight ?: return@update state
-        // 核对失败不能离线启动，也不能把关注项里的旧数据当成刚核对过。
-        state.copy(preflight = current.copy(verifying = false, verifiedAt = null, error = "站台线路无法联网核对：${error.message ?: "请稍后重试"}"))
+        val current = state.preflight?.takeIf { it.verification === verification } ?: return@update state
+        val message = if (error is CancellationException) null else "站台线路无法联网核对：${error.message ?: "请稍后重试"}"
+        state.copy(preflight = current.copy(verifying = false, verifiedAt = null, verification = null, error = message))
       }
+      if (error is CancellationException) throw error
+      return null
     }
   }
 
   /** 由可见页面手动开始一次有限等车；任一前置条件不满足都不假启动。 */
-  suspend fun startWait() {
+  suspend fun startWait() { startWait(state.value.preflight ?: return) }
+
+  private suspend fun startWait(draft: WaitPreflight) {
     val current = state.value
-    val draft = current.preflight ?: return
-    if (draft.starting || draft.verifying) return
+    if (current.preflight !== draft || draft.starting || draft.verifying) return
     if (current.wait.running) {
       mutableState.update { it.copy(preflight = draft.copy(error = "已有一轮等车在运行，先结束它再开始。")) }
       return
@@ -225,22 +263,21 @@ class WatchItemApplication(
       mutableState.update { it.copy(preflight = draft.copy(error = "预留余量不能为负，可以填 0")) }
       return
     }
-    if (draft.lines.isEmpty()) {
+    if (draft.lines.none { !it.obsolete }) {
       mutableState.update { it.copy(preflight = draft.copy(error = "没有有效选线，请先回到关注项选择线路")) }
       return
     }
     if (!platform.notificationsAllowed()) {
-      mutableState.update { it.copy(preflight = draft.copy(error = "通知总开关或出门提醒类别已关闭，无法保证提醒，未开始监测")) }
+      mutableState.update { it.copy(preflight = draft.copy(notificationBlocked = true, error = "通知总开关或出门提醒类别已关闭，无法保证提醒，未开始监测")) }
       return
     }
     if (draft.verifiedAt == null) {
       // 未核对过就必须先联网核对；核对失败不会进入启动分支。
-      verifyWait()
-      if (state.value.preflight?.verifiedAt == null) return
-      // 核对成功后直接开始，不要求用户再点一次同一个按钮。
-      return startWait()
+      val verified = verifyWait(draft) ?: return
+      // 核对成功仅能继续同一份草稿，不能把随后打开的站台自动启动。
+      return startWait(verified)
     }
-    mutableState.update { it.copy(preflight = draft.copy(starting = true, error = null)) }
+    if (!mutableState.compareAndSet(current, current.copy(preflight = draft.copy(starting = true, notificationBlocked = false, error = null)))) return
     // W/B 保存到关注项；保存失败不假启动。
     try {
       val item = withContext(Dispatchers.IO) { store.find(draft.stopCode) }
@@ -260,23 +297,17 @@ class WatchItemApplication(
       stopCode = draft.stopCode,
       stationName = draft.stationName,
       startedAt = now,
-      deadlineAt = now + MAX_WAIT,
+      deadlineAt = now.plusDelay(MAX_WAIT),
       lastSuccessAt = null,
       walkMinutes = walk,
       bufferMinutes = buffer,
       linesJson = Json.encodeToString(draft.lines),
     )
-    val started = platform.startForegroundService()
-    if (!started) {
-      mutableState.update { it.copy(preflight = draft.copy(starting = false, error = "前台服务启动失败，未开始监测")) }
-      return
-    }
-    // 最少任务状态先落盘，用于下次打开时解释中断；保存失败即拒绝启动，不假启动。
+    // 服务回调按身份收尾；在服务启动之前先落盘，再安装它要控制的会话。
     try {
       withContext(Dispatchers.IO) { tasks.save(task) }
     } catch (error: Exception) {
       if (error is CancellationException) throw error
-      platform.stopForegroundService()
       mutableState.update { it.copy(preflight = draft.copy(starting = false, error = "本机任务状态保存失败，未开始监测")) }
       return
     }
@@ -286,34 +317,107 @@ class WatchItemApplication(
       task = task,
       clock = clock,
       sleeper = sleeper,
+      elapsedClock = elapsedClock,
+      submissionSleeper = submissionSleeper,
+      requestDeadlineSleeper = requestDeadlineSleeper,
       scope = scope,
       onState = { next ->
-        mutableState.update { state -> state.copy(wait = next) }
-        // 每次状态变化都带任务身份写回：迟到回调改写不了新任务，也改不了已结束的记录。
-        scope.launch {
-          withContext(Dispatchers.IO) {
-            runCatching {
-              if (next.running) tasks.progress(task.id, next.phase ?: WaitPhase.WAITING_FIRST, next.lastSuccessAt)
-              else tasks.finish(task.id, next.endedReason ?: WaitEndReason.INTERRUPTED, next.endedAt ?: clock())
-            }
+        mutableState.update { state ->
+          if (state.wait.taskId != task.id || (!state.wait.running && next.running)) state
+          else state.copy(wait = next.copy(alerts = mergeAlerts(state.wait.alerts, next.alerts)))
+        }
+        scope.launch(Dispatchers.IO) {
+          runCatching {
+            if (next.running) tasks.progress(task.id, next.phase ?: WaitPhase.WAITING_FIRST, next.lastSuccessAt)
+            else tasks.finish(task.id, next.endedReason ?: WaitEndReason.INTERRUPTED, next.endedAt ?: clock())
           }
         }
       },
+      recordAlert = { snapshot -> withContext(Dispatchers.IO) { tasks.recordAlert(task.id, snapshot) } },
+      recordSubmissionReceipt = { tasks.recordSubmissionReceipt(task.id) },
+      markAlertSubmitted = { withContext(Dispatchers.IO) { tasks.markAlertSubmitted(task.id) } },
+      finishBeforeAlertDelivery = { reason, endedAt ->
+        withContext(Dispatchers.IO) { tasks.finishBeforeAlertDelivery(task.id, reason, endedAt) }
+      },
     )
     session = running
-    mutableState.update { it.copy(preflight = null, adding = false, confirmation = null, currentPage = true, wait = running.current()) }
-    running.start()
+    mutableState.update { it.copy(wait = running.current().copy(alerts = it.wait.alerts)) }
+    if (!platform.startForegroundService(task.id)) {
+      session = null
+      mutableState.update {
+        it.copy(wait = it.wait.copy(running = false, taskId = null), preflight = draft.copy(starting = false, error = "前台服务启动失败，未开始监测"))
+      }
+      withContext(Dispatchers.IO) { tasks.clear(task.id) }
+      return
+    }
+    mutableState.update { it.copy(preflight = null, adding = false, confirmation = null, currentPage = true) }
+    if (session === running) running.start()
   }
 
   /** 主动结束：立即停取数，退出前台服务，不发异常提示。 */
-  suspend fun stopWait() {
+  suspend fun stopWait(taskId: Long? = null) {
     val running = session
-    session = null
-    if (running != null) running.cancel()
-    else mutableState.update { it.copy(wait = it.wait.copy(running = false, endedReason = WaitEndReason.CANCELLED, message = WaitEndReason.CANCELLED.message)) }
+    if (running == null || !running.current().running || (taskId != null && running.current().taskId != taskId)) return
+    running.cancel()
     // 结束即撤下常驻通知：状态栏不能留一条点不动的"正在监测"。
-    platform.dismiss()
+    if (session === running) session = null
   }
+
+  /**
+   * 查看提醒正文：只打开查看，不确认、不停止输出、不改变服务状态。
+   * 返回该提醒是否属于某个已知任务，供页面决定是否切到提醒视图。
+   */
+  fun viewAlert(taskId: Long): Boolean {
+    val known = state.value.wait.alerts.any { it.snapshot.taskId == taskId }
+    if (known) mutableState.update { it.copy(currentPage = true, adding = false, cameraActive = false) }
+    return known
+  }
+
+  /**
+   * 「知道了，停止提醒」：停止全部输出并标记确认。
+   * 只认属于该提醒的那一轮；旧提醒的确认不会停止新任务或重置它的状态。
+   */
+  suspend fun confirmAlert(taskId: Long) = confirmAlert(taskId, fromNotification = false)
+
+  internal suspend fun confirmAlert(taskId: Long, fromNotification: Boolean) = withContext(NonCancellable) {
+    val live = session?.takeIf { it.current().taskId == taskId && it.current().running }
+    val stopped = live?.confirm(taskId, fromNotification) == true
+    if (!stopped && live?.current()?.running == true) return@withContext
+    val posted = fromNotification || state.value.wait.alerts.any { it.snapshot.taskId == taskId && it.submissionPending }
+    // 点旧通知或冷启动时，不依赖页面内存；事务用完整身份确认存在的快照。
+    val confirmed = try {
+      withContext(Dispatchers.IO) {
+        val stillPosted = taskId in platform.postedAlertIds()
+        val hasEvidence = posted || stillPosted
+        val saved = runCatching {
+          if (hasEvidence) tasks.confirmPostedAlert(taskId) else tasks.confirmAlert(taskId)
+        }
+        // 冷启动时系统通知可能是 pending 的唯一提交证据，确认落库前不能撤掉。
+        if (saved.getOrDefault(false)) platform.clearAlert(taskId)
+        // 划除已移走原通知；只有可信通知动作才能替不存在的槽位留下收据。
+        else if (saved.isFailure && fromNotification && !stillPosted) runCatching { tasks.recordSubmissionReceipt(taskId) }
+        saved.getOrThrow()
+      }
+    } catch (error: Exception) {
+      if (error is CancellationException) throw error
+      false
+    }
+    mutableState.update { state ->
+      val wait = state.wait
+      val alerts = wait.alerts.map {
+        if (it.snapshot.taskId == taskId && !it.confirmed) {
+          it.copy(confirmed = confirmed, outputEnded = true, confirmationError = !confirmed)
+        } else it
+      }
+      state.copy(wait = if (confirmed && wait.taskId == taskId && !wait.running && wait.endedReason == WaitEndReason.ALERTED) {
+        wait.copy(alerts = alerts, endedReason = WaitEndReason.ALERT_CONFIRMED, message = WaitEndReason.ALERT_CONFIRMED.message)
+      } else wait.copy(alerts = alerts))
+    }
+  }
+
+  /** 从磁盘恢复时不能把仍在本进程输出的提醒改成已结束。 */
+  private fun mergeAlerts(current: List<OutingAlert>, incoming: List<OutingAlert>): List<OutingAlert> =
+    (incoming + current).distinctBy { it.snapshot.taskId }.sortedByDescending { it.snapshot.taskId }
 
   fun imageFailure(message: String) {
     mutableState.update { it.copy(message = message, adding = true) }
@@ -323,12 +427,12 @@ class WatchItemApplication(
    * 前台服务在进程内判定失败（例如系统拒绝前台提升）时结束同一轮等车。
    * 只结束仍在运行的那一轮；已结束的轮次不被旧回调改写。
    */
-  suspend fun failWait(reason: WaitEndReason) {
-    val running = session
-    session = null
-    if (running != null) running.terminate()
-    else mutableState.update { it.copy(wait = it.wait.copy(running = false, endedReason = reason, message = reason.message)) }
-    platform.dismiss()
+  suspend fun failWait(reason: WaitEndReason, taskId: Long? = null) {
+    val running = session ?: return
+    val wait = running.current()
+    if (!wait.running || (taskId != null && wait.taskId != taskId)) return
+    running.terminate(reason)
+    if (session === running) session = null
   }
 
   suspend fun decoded(rawValues: List<String>) {
@@ -352,6 +456,8 @@ class WatchItemApplication(
       loadStop(station, station.defaultStopCode, token, restoreOriginal = true)
     } catch (error: Exception) {
       handleFailure(token, error)
+    } finally {
+      finishLoading(token)
     }
   }
 
@@ -366,6 +472,8 @@ class WatchItemApplication(
       loadStop(current.station, stopCode, token, restoreOriginal = false)
     } catch (error: Exception) {
       handleFailure(token, error)
+    } finally {
+      finishLoading(token)
     }
   }
 
@@ -380,6 +488,7 @@ class WatchItemApplication(
     mutableState.update { it.copy(loading = true, message = null) }
     try { loadStop(current.station, current.stopCode, token, restoreOriginal = current.fetchedAt == null && current.restoreOriginalOnLoad) }
     catch (error: Exception) { handleFailure(token, error) }
+    finally { finishLoading(token) }
   }
 
   private suspend fun loadStop(station: StationChoice, stopCode: String, token: Long, restoreOriginal: Boolean) {
@@ -643,21 +752,35 @@ class WatchItemApplication(
         bufferMinutes = original?.bufferMinutes ?: 2.0,
         lastCheckedAt = draft.fetchedAt ?: original?.lastCheckedAt,
       )
-      withContext(Dispatchers.IO) { store.save(item) }
-      revision.incrementAndGet()
-      mutableState.update {
-        it.copy(items = (it.items.filterNot { saved -> saved.stopCode == item.stopCode } + item).sortedBy { saved -> saved.stationName }, saving = false, adding = false, editing = false, confirmation = null, message = "关注项已保存，没有开始等车")
+      // Room 写入和进程级 UI 状态必须一起完成，即使发起保存的 Activity 已销毁。
+      withContext(NonCancellable) {
+        withContext(Dispatchers.IO) { store.save(item) }
+        revision.incrementAndGet()
+        mutableState.update {
+          it.copy(items = (it.items.filterNot { saved -> saved.stopCode == item.stopCode } + item).sortedBy { saved -> saved.stationName }, saving = false, adding = false, editing = false, confirmation = null, message = "关注项已保存，没有开始等车")
+        }
       }
     } catch (error: Exception) {
       if (error is CancellationException) throw error
       mutableState.update { it.copy(saving = false, message = "保存失败，选线草稿仍保留，请重试；已有关注项未改变") }
+    } finally {
+      mutableState.update { it.copy(saving = false) }
     }
   }
 
-  private fun handleFailure(token: Long, error: Exception) {    if (error is CancellationException) throw error
-    if (token != revision.get()) return
-    mutableState.update { it.copy(loading = false, message = "站台或线路获取失败：${error.message ?: "请稍后重试"}；已有关注项未改变") }
+  private fun handleFailure(token: Long, error: Exception) {
+    if (error is CancellationException) throw error
+    mutableState.update { current ->
+      if (token != revision.get()) current
+      else current.copy(message = "站台或线路获取失败：${error.message ?: "请稍后重试"}；已有关注项未改变")
+    }
   }
+
+  /** Activity 取消请求时也恢复按钮；旧请求不能清除新草稿的加载状态。 */
+  private fun finishLoading(token: Long) {
+    mutableState.update { if (token == revision.get()) it.copy(loading = false) else it }
+  }
+
 }
 
 data class WatchItemsState(
