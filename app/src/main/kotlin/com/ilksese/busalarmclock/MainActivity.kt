@@ -71,25 +71,64 @@ class WatchItemsViewModel(application: Application) : AndroidViewModel(applicati
     RoomWatchItemStore(database),
     AndroidWaitPlatform(application),
     tasks = RoomWaitTaskStore(database),
+    notifier = QuietLineStatusNotifier(application),
   )
   override fun onCleared() { database.close() }
 }
 
 class MainActivity : ComponentActivity() {
+  private var cameraPermissionContinuation: ((Boolean) -> Unit)? = null
+  private val requestCamera = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+    val continuation = cameraPermissionContinuation
+    cameraPermissionContinuation = null
+    continuation?.invoke(granted)
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     enableEdgeToEdge()
     setContent {
       val model: WatchItemsViewModel = viewModel()
-      BusAlarmClockTheme { WatchItemsScreen(model.applicationBehavior, model.viewModelScope) }
+      val context = androidx.compose.ui.platform.LocalContext.current
+      // 仅在用户进入相机扫码时申请 CAMERA；退出取景即释放，不启用相机前台服务。
+      val access = CameraAccess(
+        granted = android.content.pm.PackageManager.PERMISSION_GRANTED ==
+          context.checkSelfPermission(android.Manifest.permission.CAMERA),
+        request = { continuation ->
+          cameraPermissionContinuation = continuation
+          requestCamera.launch(android.Manifest.permission.CAMERA)
+        },
+      )
+      BusAlarmClockTheme {
+        WatchItemsScreen(
+          model.applicationBehavior,
+          model.viewModelScope,
+          cameraAccess = access,
+          viewfinder = { onDecoded -> QrViewfinder(onDecoded) },
+        )
+      }
     }
   }
 }
 
-/** 两主页与同一添加流程；UI 不直接发 HTTP 请求或写 Room。 */
+/** 相机可用性由 Activity 注入；测试可控制授权结果而不触碰真实硬件。 */
+class CameraAccess(val granted: Boolean, val request: ((Boolean) -> Unit) -> Unit = { it(granted) })
+
+/** 进入扫码时可能处于“等待授权”，此时不能预览，也不能假装已在取景。 */
+enum class CameraPhase { GRANTED, PENDING, DENIED }
+
+/**
+ * 两个主页与同一添加流程；UI 不直接发 HTTP 请求或写 Room。
+ * 相机只在添加流程内出现，[viewfinder] 负责真实取景并把识别结果交回同一导入入口。
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.coroutines.CoroutineScope? = null) {
+fun WatchItemsScreen(
+  application: WatchItemApplication,
+  actionScope: kotlinx.coroutines.CoroutineScope? = null,
+  cameraAccess: CameraAccess = CameraAccess(granted = false),
+  viewfinder: (@Composable (onDecoded: (String) -> Boolean) -> Unit)? = null,
+) {
   val state by application.state.collectAsStateWithLifecycle()
   val compositionScope = rememberCoroutineScope()
   val scope = actionScope ?: compositionScope
@@ -101,6 +140,28 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
   DisposableEffect(application, scope) {
     WaitRuntime.onStop = { scope.launch { application.stopWait() } }
     onDispose { WaitRuntime.onStop = null }
+  }
+
+  // 同步判定是否接管：不受支持的码仍交给应用层给出提示并保留取景，但不占用“一码只交付一次”的机会。
+  fun importCamera(rawValue: String): Boolean {
+    val accepted = application.isCameraCodeAccepted(rawValue)
+    scope.launch { application.cameraDecoded(rawValue) }
+    return accepted
+  }
+
+  var cameraPhase by remember(cameraAccess.granted) {
+    mutableStateOf(if (cameraAccess.granted) CameraPhase.GRANTED else CameraPhase.PENDING)
+  }
+
+  fun startCamera() {
+    application.openCamera()
+    cameraPhase = if (cameraAccess.granted) CameraPhase.GRANTED else CameraPhase.PENDING
+    if (cameraAccess.granted) return
+    cameraAccess.request { granted ->
+      // 拒绝或取消授权都只回到添加面板，相册入口与已有关注项不受影响。
+      cameraPhase = if (granted) CameraPhase.GRANTED else CameraPhase.DENIED
+      if (!granted) application.cameraPermissionDenied()
+    }
   }
 
   fun scan(uri: Uri) {
@@ -128,14 +189,15 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
   val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { it?.let(::scan) }
   val documentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(::scan) }
   fun cancel() { scanGeneration++; scanning = false; application.cancel() }
-  BackHandler(state.adding && !state.saving) { cancel() }
+  fun leaveCamera() { scanGeneration++; scanning = false; application.closeCamera() }
+  BackHandler(state.adding && !state.saving) { if (state.cameraActive) leaveCamera() else cancel() }
 
   Scaffold(
     topBar = {
       TopAppBar(
         title = { Text(if (state.adding) "确认上车站台" else if (state.currentPage) "当前等车" else "关注项") },
         navigationIcon = {
-          if (state.adding) IconButton(enabled = !state.saving, onClick = { cancel() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "取消添加") }
+          if (state.adding) IconButton(enabled = !state.saving, onClick = { if (state.cameraActive) leaveCamera() else cancel() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, if (state.cameraActive) "退出扫码" else "取消添加") }
         },
         actions = {
           if (!state.adding && !state.currentPage) IconButton(onClick = application::showAdd) { Icon(Icons.Default.Add, "添加站台") }
@@ -159,38 +221,73 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
       when {
         state.adding -> {
           val draft = state.confirmation
-          if (draft == null) {
+          if (state.cameraActive) {
             item {
-              Text("从相册识别", style = MaterialTheme.typography.headlineMedium)
-              Text("选择含公交二维码的图片，随后确认具体站台与线路方向。", modifier = Modifier.padding(top = 12.dp))
+              Text("扫描站台二维码", style = MaterialTheme.typography.headlineMedium)
+              Text("将站台二维码放入框内，识别后进入同一站台与线路确认流程。", modifier = Modifier.padding(top = 12.dp))
               Text("不获取定位，不保存扫码照片。", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
             }
-            item { PrimaryAction("从相册选择", enabled = !scanning && !state.loading) { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) } }
-            item { SecondaryAction("选图不可用？从系统文件选择", enabled = !scanning && !state.loading) { documentPicker.launch(arrayOf("image/*")) } }
+            item {
+              when (cameraPhase) {
+                // 只有真正拿到授权才挂载取景；等待授权期间不能显示空画面冒充取景。
+                CameraPhase.GRANTED -> viewfinder?.invoke(::importCamera) ?: Text("当前无法预览相机画面，可从相册选择。")
+                CameraPhase.PENDING -> Text("等待相机授权…授权后自动开始取景；也可以返回改用相册。")
+                CameraPhase.DENIED -> Text("相机未授权，仍可从相册选择。")
+              }
+            }
+            item { Text("识别受支持的公交站台码后自动继续；其他码会被忽略。", style = MaterialTheme.typography.bodySmall) }
+            item { SecondaryAction("取消扫码") { leaveCamera() } }
+          } else if (draft == null) {
+            item {
+              Text("添加上车站台", style = MaterialTheme.typography.headlineMedium)
+              Text("扫描公交站台二维码，随后确认具体站台与线路方向。", modifier = Modifier.padding(top = 12.dp))
+              Text("不获取定位，不保存扫码照片。", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+            }
+            item { PrimaryAction("相机扫码", enabled = !scanning && !state.loading) { startCamera() } }
+            item { SecondaryAction("从相册选择", enabled = !scanning && !state.loading) { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) } }
+            item { TextButton(enabled = !scanning && !state.loading, onClick = { documentPicker.launch(arrayOf("image/*")) }) { Text("从系统文件选择") } }
           } else {
             item {
               Text(draft.station.stationName, style = MaterialTheme.typography.headlineSmall)
-              Text("站台 ${draft.stopCode}${if (draft.stopCode == draft.station.defaultStopCode) " · 二维码指向站台" else " · 同名另一站台"}")
+              Text("站台 ${draft.stopCode}${if (draft.editing) " · 编辑选线，换站台请另行添加" else if (draft.stopCode == draft.station.defaultStopCode) " · 二维码指向站台" else " · 同名另一站台"}")
             }
-            item { Text("核对具体上车站台", style = MaterialTheme.typography.labelLarge) }
-            draft.station.stops.forEach { stop ->
-              item(key = "stop-${stop.stopCode}") {
-                val isSelected = draft.stopCode == stop.stopCode
-                val choose: () -> Unit = { scope.launch { application.chooseStop(stop.stopCode) }; Unit }
-                // D 原型整行可点；用 selectable 承担整行点击与单选语义，RadioButton 自身不再响应点击。
-                Row(
-                  Modifier.fillMaxWidth()
-                    .selectable(selected = isSelected, enabled = !state.saving, role = Role.RadioButton, onClick = choose)
-                    .padding(vertical = 12.dp),
-                  verticalAlignment = Alignment.CenterVertically,
-                ) {
-                  RadioButton(selected = isSelected, enabled = !state.saving, onClick = null)
-                  Spacer(Modifier.width(12.dp))
-                  Text("站台 ${stop.stopCode}${if (stop.stopCode == draft.station.defaultStopCode) " · 二维码默认" else " · 同名另一站台"}")
+            if (draft.editing) {
+              item { Text("编辑已有关注项：站台不变，只改选线路。", style = MaterialTheme.typography.bodySmall) }
+            } else {
+              item { Text("核对具体上车站台", style = MaterialTheme.typography.labelLarge) }
+              draft.station.stops.forEach { stop ->
+                item(key = "stop-${stop.stopCode}") {
+                  val isSelected = draft.stopCode == stop.stopCode
+                  val choose: () -> Unit = { scope.launch { application.chooseStop(stop.stopCode) }; Unit }
+                  // D 原型整行可点；用 selectable 承担整行点击与单选语义，RadioButton 自身不再响应点击。
+                  Row(
+                    Modifier.fillMaxWidth()
+                      .selectable(selected = isSelected, enabled = !state.saving, role = Role.RadioButton, onClick = choose)
+                      .padding(vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                    RadioButton(selected = isSelected, enabled = !state.saving, onClick = null)
+                    Spacer(Modifier.width(12.dp))
+                    Text("站台 ${stop.stopCode}${if (stop.stopCode == draft.station.defaultStopCode) " · 二维码默认" else " · 同名另一站台"}")
+                  }
+                }
+              }
+              if (draft.isUpdate) item { Text("已关注此站台：保存会更新已有项，取消保持原选择。", color = MaterialTheme.colorScheme.primary) }
+            }
+            // 过时记录置灰且只能删除；即使全部过时也保留关注项本身。
+            draft.obsoleteRecords.forEach { record ->
+              item(key = "obsolete-${record.identity}") {
+                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                  RouteTag(record.lineName, enabled = false)
+                  Spacer(Modifier.width(11.dp))
+                  Column(Modifier.weight(1f)) {
+                    Text("开往${record.endStationName}", style = MaterialTheme.typography.bodyMedium, color = SubText)
+                    Text("过时，仅可删除记录", style = MaterialTheme.typography.bodySmall, color = SubText)
+                  }
+                  TextButton(enabled = !state.saving, onClick = { scope.launch { application.removeRecord(record.identity) } }) { Text("删除过时记录") }
                 }
               }
             }
-            if (draft.isUpdate) item { Text("已关注此站台：保存会更新已有项，取消保持原选择。", color = MaterialTheme.colorScheme.primary) }
             item { Text("选择你可乘坐的线路方向", style = MaterialTheme.typography.titleMedium) }
             draft.availableLines.forEach { line ->
               item(key = "line-${line.identity}") {
@@ -233,6 +330,9 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
         }
         else -> {
           if (state.items.isEmpty()) item { EmptyState("下一站，\n从这里开始。", "点右上角加号，识别公交二维码并保存你的上车站台。") }
+          if (state.items.isNotEmpty()) {
+            item { SecondaryAction("核对线路最新状态", enabled = !state.loading && !state.saving) { scope.launch { application.refresh() } } }
+          }
           state.items.forEach { item ->
             item(key = item.stopCode) {
               Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(top = 19.dp, bottom = 23.dp)) {
@@ -240,12 +340,22 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
                 Text("站台 ${item.stopCode} · ${item.selectedLines.size} 条已选线路", style = MaterialTheme.typography.bodySmall, color = SubText)
                 item.selectedLines.forEach { line ->
                   Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    RouteTag(line.lineName)
+                    // 过时记录置灰且只允许删除，避免把已消失的方向继续当作可乘线路。
+                    RouteTag(line.lineName, enabled = !line.obsolete)
                     Spacer(Modifier.width(11.dp))
-                    Text("开往${line.endStationName}", style = MaterialTheme.typography.bodyMedium, color = BodyText)
+                    Column(Modifier.weight(1f)) {
+                      Text("开往${line.endStationName}", style = MaterialTheme.typography.bodyMedium, color = if (line.obsolete) SubText else BodyText)
+                      if (line.obsolete) Text("过时 · 不参与提醒", style = MaterialTheme.typography.bodySmall, color = SubText)
+                    }
+                    if (line.obsolete) TextButton(onClick = { scope.launch { application.removeStoredRecord(item.stopCode, line.identity) } }) { Text("删除记录") }
                   }
                 }
-                Text("本机保存 · 尚未联网核对", style = MaterialTheme.typography.bodySmall, color = SubText)
+                Text(
+                  if (item.lastCheckedAt == null) "本机保存 · 尚未联网核对"
+                  else "最后成功核对：${DateFormat.getTimeInstance().format(Date(item.lastCheckedAt))}",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = SubText,
+                )
                 Button(
                   onClick = { application.prepareWait(item.stopCode) },
                   enabled = !state.wait.running,
@@ -253,6 +363,10 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
                   contentPadding = PaddingValues(vertical = 12.dp, horizontal = 16.dp),
                   modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                 ) { Text(if (state.wait.running) "已有一轮等车在运行" else "开始等车", style = MaterialTheme.typography.labelLarge) }
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                  TextButton(enabled = !state.saving, onClick = { scope.launch { application.edit(item.stopCode) } }) { Text("编辑选线") }
+                  TextButton(enabled = !state.saving, onClick = { application.requestDelete(item.stopCode) }) { Text("删除关注项") }
+                }
                 HorizontalDivider(color = Hairline)
               }
             }
@@ -267,6 +381,16 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
     text = { Column { state.codes.forEach { code -> TextButton(onClick = { scope.launch { application.importCode(code) } }) { Text("站台码 $code") } } } },
     confirmButton = {}, dismissButton = { TextButton(onClick = { cancel() }) { Text("取消") } },
   )
+  state.deleting?.let { stopCode ->
+    val item = state.items.firstOrNull { it.stopCode == stopCode }
+    AlertDialog(
+      onDismissRequest = { application.cancelDelete() },
+      title = { Text("删除关注项") },
+      text = { Text("将删除站台 $stopCode 的关注项与已保存的 ${item?.selectedLines?.size ?: 0} 条线路记录，不会开始或结束任何等车。") },
+      confirmButton = { TextButton(onClick = { scope.launch { application.confirmDelete() } }) { Text("确认删除") } },
+      dismissButton = { TextButton(onClick = { application.cancelDelete() }) { Text("取消") } },
+    )
+  }
 }
 
 /** 开始前同屏核对：站台线路、步行时间 W 与预留余量 B；不自动估算 W。 */
@@ -464,12 +588,12 @@ private fun SecondaryAction(text: String, enabled: Boolean = true, onClick: () -
 
 /** D 原型线路标签：浅柠底、深石蓝、8dp 圆角，最小 43dp 宽。 */
 @Composable
-private fun RouteTag(lineName: String) {
+private fun RouteTag(lineName: String, enabled: Boolean = true) {
   Box(
-    Modifier.heightIn(min = 29.dp).width(43.dp).background(Accent, RoundedCornerShape(8.dp)),
+    Modifier.heightIn(min = 29.dp).width(43.dp).background(if (enabled) Accent else SoftSurface, RoundedCornerShape(8.dp)),
     contentAlignment = Alignment.Center,
   ) {
-    Text(lineName.removeSuffix("路"), style = MaterialTheme.typography.labelMedium, color = DeepBlue, maxLines = 1)
+    Text(lineName.removeSuffix("路"), style = MaterialTheme.typography.labelMedium, color = if (enabled) DeepBlue else SubText, maxLines = 1)
   }
 }
 

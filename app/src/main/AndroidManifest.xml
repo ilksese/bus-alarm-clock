@@ -2,11 +2,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 仅在用户进入相机扫码时申请；相册导入不需要相机权限。 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- 仅用于线路过时/恢复的安静文字通知；未授权时跳过通知，不影响关注项数据。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 等车期间的前台数据同步服务；启动时申请通知授权，撤销后仍继续监测。 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
         android:allowBackup="false"

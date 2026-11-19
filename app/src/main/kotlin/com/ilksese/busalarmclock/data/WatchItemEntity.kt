@@ -25,6 +25,9 @@ data class SavedLine(
   val identity: String get() = "$lineNo|$upDown|$targetSequence"
 }
 
+/** 与最新清单比对用的方向身份；站序变化不属于线路消失。 */
+val SavedLine.direction: String get() = "$lineNo|$upDown"
+
 @Entity(tableName = "watch_items")
 data class WatchItemEntity(
   @PrimaryKey val stopCode: String,
@@ -36,6 +39,8 @@ data class WatchItemEntity(
   @ColumnInfo(defaultValue = "''") val selectedLinesJson: String = Json.encodeToString(listOf(SavedLine(lineNo, upDown, endStationName, targetSequence))),
   val walkMinutes: Double? = null,
   @ColumnInfo(defaultValue = "2.0") val bufferMinutes: Double = 2.0,
+  /** 最近一次成功核对的来源获取时间；为空表示本机保存后尚未联网核对。 */
+  val lastCheckedAt: Long? = null,
 ) {
   val selectedLines: List<SavedLine>
     get() = runCatching { Json.decodeFromString<List<SavedLine>>(selectedLinesJson) }
@@ -57,7 +62,7 @@ interface WatchItemDao {
   suspend fun delete(stopCode: String)
 }
 
-@Database(entities = [WatchItemEntity::class, WaitTaskEntity::class], version = 3, exportSchema = false)
+@Database(entities = [WatchItemEntity::class, WaitTaskEntity::class], version = 4, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
   abstract fun watchItemDao(): WatchItemDao
   abstract fun waitTaskDao(): WaitTaskDao
