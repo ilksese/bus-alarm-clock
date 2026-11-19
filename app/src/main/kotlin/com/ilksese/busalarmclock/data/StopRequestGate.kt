@@ -10,7 +10,11 @@ import kotlinx.coroutines.sync.withLock
 /** 同一来源请求共享在途结果，成功与失败都计入间隔；缓存保留实际接收时间。 */
 class StopRequestGate(private val clock: () -> Long = { System.nanoTime() / 1_000_000 }) {
   private val mutex = Mutex()
-  private val entries = mutableMapOf<String, Entry>()
+  // 只在锁外读取下次允许时间的调度方需要并发安全；写入仍在 mutex 内完成。
+  private val entries = java.util.concurrent.ConcurrentHashMap<String, Entry>()
+
+  /** 该请求最早可再次发起的时间；从未请求返回 Long.MIN_VALUE。 */
+  fun nextAllowedAt(key: String): Long = entries[key]?.nextAllowedAt ?: Long.MIN_VALUE
 
   suspend fun request(key: String, loader: suspend () -> HttpPayload): SourceSnapshot<String> {
     var owner = false
@@ -64,4 +68,12 @@ class StopRequestGate(private val clock: () -> Long = { System.nanoTime() / 1_00
 
 data class SourceSnapshot<T>(val value: T, val fetchedAt: Long, val nextAllowedAt: Long)
 data class HttpPayload(val body: String, val retryAfterMillis: Long = 0)
-class SourceFailure(message: String, val retryAt: Long = 0) : Exception(message)
+
+/** 失败类别决定等车是「按间隔重试」还是直接结束本次监测。 */
+enum class SourceFailureKind { TRANSIENT, AUTH, DENIED, TERMINATED }
+
+class SourceFailure(
+  message: String,
+  val retryAt: Long = 0,
+  val kind: SourceFailureKind = SourceFailureKind.TRANSIENT,
+) : Exception(message)

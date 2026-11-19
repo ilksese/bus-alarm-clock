@@ -4,7 +4,42 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.serialization.json.Json
 
-/** 保留旧单线路记录和站台身份，不使用破坏性迁移或清库恢复。 */
+/**
+ * 建最少任务状态表的主体，供迁移复用。
+ * 单独抽出是因为 #18 也会占用 v3；合并时只需新增 `MIGRATION_3_4` 调用本函数，
+ * 不必复制建表语句，也不用改动这里的列定义。
+ */
+internal fun createWaitTasksTable(database: SupportSQLiteDatabase) {
+  database.execSQL(
+    """
+    CREATE TABLE IF NOT EXISTS `wait_tasks` (
+      `slot` INTEGER NOT NULL,
+      `id` INTEGER NOT NULL,
+      `stopCode` TEXT NOT NULL,
+      `stationName` TEXT NOT NULL,
+      `linesJson` TEXT NOT NULL,
+      `walkMinutes` REAL NOT NULL,
+      `bufferMinutes` REAL NOT NULL,
+      `startedAt` INTEGER NOT NULL,
+      `deadlineAt` INTEGER NOT NULL,
+      `lastSuccessAt` INTEGER,
+      `phase` TEXT DEFAULT NULL,
+      `endedReason` TEXT DEFAULT NULL,
+      `endedAt` INTEGER DEFAULT 0,
+      PRIMARY KEY(`slot`)
+    )
+    """.trimIndent(),
+  )
+}
+
+/**
+ * 新增最少任务状态表；只建表，不动已有的关注项数据。
+ * 合并 #18 后本迁移需重命名为 `MIGRATION_3_4`（见 [createWaitTasksTable]）。
+ */
+val MIGRATION_2_3 = object : Migration(2, 3) {
+  override fun migrate(database: SupportSQLiteDatabase) = createWaitTasksTable(database)
+}
+
 val MIGRATION_1_2 = object : Migration(1, 2) {
   override fun migrate(database: SupportSQLiteDatabase) {
     database.execSQL("ALTER TABLE watch_items ADD COLUMN selectedLinesJson TEXT NOT NULL DEFAULT ''")

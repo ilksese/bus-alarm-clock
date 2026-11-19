@@ -57,6 +57,8 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import com.ilksese.busalarmclock.data.*
 import com.ilksese.busalarmclock.ui.theme.BusAlarmClockTheme
+import com.ilksese.busalarmclock.wait.AndroidWaitPlatform
+import com.ilksese.busalarmclock.wait.WaitRuntime
 import java.text.DateFormat
 import java.util.Date
 import kotlinx.coroutines.launch
@@ -64,7 +66,12 @@ import kotlinx.coroutines.launch
 /** 配置变化复用同一行为入口与请求状态，不因重建 Activity 绕过请求间隔。 */
 class WatchItemsViewModel(application: Application) : AndroidViewModel(application) {
   private val database = DatabaseProvider.create(application)
-  val applicationBehavior = WatchItemApplication(BusSourceClient(), RoomWatchItemStore(database))
+  val applicationBehavior = WatchItemApplication(
+    BusSourceClient(),
+    RoomWatchItemStore(database),
+    AndroidWaitPlatform(application),
+    tasks = RoomWaitTaskStore(database),
+  )
   override fun onCleared() { database.close() }
 }
 
@@ -90,6 +97,11 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
   var scanning by remember { mutableStateOf(false) }
   var scanGeneration by remember { mutableLongStateOf(0) }
   LaunchedEffect(application) { application.open() }
+  // 常驻通知的停止入口必须结束同一轮等车，而不是另开一份任务。
+  DisposableEffect(application, scope) {
+    WaitRuntime.onStop = { scope.launch { application.stopWait() } }
+    onDispose { WaitRuntime.onStop = null }
+  }
 
   fun scan(uri: Uri) {
     val generation = ++scanGeneration
@@ -201,9 +213,22 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
           item { TextButton(enabled = !state.saving, onClick = { cancel() }) { Text("取消，保持原状") } }
         }
         state.currentPage -> {
+          val preflight = state.preflight
           item {
-            EmptyState("还没开始等车", "去关注项，选一个具体站台开始。")
-            SecondaryAction("去关注项") { application.showCurrent(false) }
+            Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
+              if (preflight != null) {
+                WaitPreflightPanel(preflight, scope, application)
+              } else if (state.wait.stopCode != null) {
+                WaitingPanel(state.wait, scope, application)
+              } else {
+                EmptyState("还没开始等车", "去关注项，选一个具体站台开始。")
+                SecondaryAction("去关注项") { application.showCurrent(false) }
+              }
+              val endedMessage = state.wait.message
+              if (state.wait.endedReason != null && endedMessage != null && !state.wait.running) {
+                Text(endedMessage, color = SubText, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
+              }
+            }
           }
         }
         else -> {
@@ -221,6 +246,13 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
                   }
                 }
                 Text("本机保存 · 尚未联网核对", style = MaterialTheme.typography.bodySmall, color = SubText)
+                Button(
+                  onClick = { application.prepareWait(item.stopCode) },
+                  enabled = !state.wait.running,
+                  shape = RoundedCornerShape(17.dp),
+                  contentPadding = PaddingValues(vertical = 12.dp, horizontal = 16.dp),
+                  modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                ) { Text(if (state.wait.running) "已有一轮等车在运行" else "开始等车", style = MaterialTheme.typography.labelLarge) }
                 HorizontalDivider(color = Hairline)
               }
             }
@@ -237,8 +269,161 @@ fun WatchItemsScreen(application: WatchItemApplication, actionScope: kotlinx.cor
   )
 }
 
-/** 首页留白与原生层级，不以规则文字堆叠替代主状态。 */
+/** 开始前同屏核对：站台线路、步行时间 W 与预留余量 B；不自动估算 W。 */
 @Composable
+private fun WaitPreflightPanel(
+  draft: WaitPreflight,
+  scope: kotlinx.coroutines.CoroutineScope,
+  application: WatchItemApplication,
+) {
+  Text(draft.stationName, style = MaterialTheme.typography.headlineSmall, color = BodyText)
+  Text("站台 ${draft.stopCode}", style = MaterialTheme.typography.bodySmall, color = SubText)
+  Spacer(Modifier.size(16.dp))
+  draft.lines.forEach { line ->
+    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+      RouteTag(line.lineName)
+      Spacer(Modifier.width(11.dp))
+      Text("开往${line.endStationName}", style = MaterialTheme.typography.bodyMedium, color = BodyText)
+    }
+  }
+  Spacer(Modifier.size(16.dp))
+  Row(verticalAlignment = Alignment.CenterVertically) {
+    OutlinedTextField(
+      value = draft.walkText,
+      onValueChange = application::updateWalk,
+      label = { Text("步行时间 W（分钟）") },
+      singleLine = true,
+      enabled = !draft.starting,
+      modifier = Modifier.weight(1f),
+    )
+    Spacer(Modifier.width(12.dp))
+    OutlinedTextField(
+      value = draft.bufferText,
+      onValueChange = application::updateBuffer,
+      label = { Text("预留余量 B（分钟）") },
+      singleLine = true,
+      enabled = !draft.starting,
+      modifier = Modifier.weight(1f),
+    )
+  }
+  val walk = draft.walkMinutes
+  val buffer = draft.bufferMinutes
+  if (walk != null && buffer != null) {
+    Text(
+      "预计进入 ${formatMinutes(walk)}–${formatMinutes(walk + buffer)} 分钟时提醒你",
+      style = MaterialTheme.typography.bodySmall,
+      color = SubText,
+      modifier = Modifier.padding(top = 12.dp),
+    )
+  }
+  draft.verifiedAt?.let { at ->
+    Text(
+      "线路核对时间：${DateFormat.getTimeInstance().format(Date(at))}",
+      style = MaterialTheme.typography.bodySmall,
+      color = SubText,
+      modifier = Modifier.padding(top = 8.dp),
+    )
+  }
+  draft.error?.let { Text(it, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 12.dp)) }
+  Spacer(Modifier.size(16.dp))
+  PrimaryAction(
+    when {
+      draft.starting -> "正在开始…"
+      draft.verifying -> "正在核对站台与线路…"
+      else -> "开始监测"
+    },
+    enabled = !draft.starting && !draft.verifying,
+  ) { scope.launch { application.startWait() } }
+  TextButton(enabled = !draft.starting && !draft.verifying, onClick = application::dismissPreflight) { Text("取消") }
+  Text("开始前会先联网核对站台与线路；核对失败不会离线开始。", style = MaterialTheme.typography.bodySmall, color = SubText)
+  Text("本次最多监测 30 分钟；连续 5 分钟没有成功响应会自动结束。", style = MaterialTheme.typography.bodySmall, color = SubText)
+}
+
+/** D 的 B 画面：状态胶囊、当前预计、标题与线路条；不含原型调试控件。 */
+@Composable
+private fun WaitingPanel(
+  wait: WaitState,
+  scope: kotlinx.coroutines.CoroutineScope,
+  application: WatchItemApplication,
+) {
+  val phase = wait.phase
+  val primary = wait.lines.firstOrNull { it.minutes != null }
+  Row(verticalAlignment = Alignment.CenterVertically) {
+    Box(Modifier.size(8.dp).background(if (wait.running) Accent else SubText, CircleShape))
+    Spacer(Modifier.width(8.dp))
+    Text(
+      if (!wait.running) (wait.endedReason?.let { "本次等车已结束" } ?: "本次等车已结束") else (phase?.label ?: WaitPhase.WAITING_FIRST.label),
+      style = MaterialTheme.typography.labelLarge,
+      color = if (wait.running) Accent else SubText,
+    )
+  }
+  Spacer(Modifier.size(18.dp))
+  Text(
+    primary?.minutes?.toString() ?: "–",
+    style = MaterialTheme.typography.displayLarge,
+    color = BodyText,
+  )
+  Text(
+    if (primary == null) "暂无可用预测" else "分钟 · 当前预计 ${primary.lineName}",
+    style = MaterialTheme.typography.bodySmall,
+    color = SubText,
+  )
+  Spacer(Modifier.size(14.dp))
+  Text(wait.stationName.orEmpty(), style = MaterialTheme.typography.headlineMedium, color = BodyText)
+  val walk = wait.walkMinutes
+  val buffer = wait.bufferMinutes
+  if (walk != null && buffer != null) {
+    Text(
+      "预计进入 ${formatMinutes(walk)}–${formatMinutes(walk + buffer)} 分钟时提醒你",
+      style = MaterialTheme.typography.bodySmall,
+      color = SubText,
+      modifier = Modifier.padding(top = 8.dp),
+    )
+  }
+  Spacer(Modifier.size(16.dp))
+  Column(Modifier.fillMaxWidth().background(SoftSurface, RoundedCornerShape(17.dp)).padding(16.dp)) {
+    wait.lines.forEach { line ->
+      Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        RouteTag(line.lineName)
+        Spacer(Modifier.width(11.dp))
+        Text("开往${line.endStationName}", style = MaterialTheme.typography.bodyMedium, color = BodyText)
+        Spacer(Modifier.weight(1f))
+        Text(
+          when {
+            line.arriving -> "即将到站"
+            line.minutes != null -> "${line.minutes} 分钟"
+            else -> "暂无预测"
+          },
+          style = MaterialTheme.typography.bodyMedium,
+          color = if (line.minutes != null) BodyText else SubText,
+        )
+      }
+    }
+  }
+  Spacer(Modifier.size(12.dp))
+  val lastSuccess = wait.lastSuccessAt
+  Text(
+    buildString {
+      append("最后成功：")
+      append(lastSuccess?.let { DateFormat.getTimeInstance().format(Date(it)) } ?: "尚未成功")
+      append(" · 请求间隔至少 60 秒")
+    },
+    style = MaterialTheme.typography.bodySmall,
+    color = SubText,
+  )
+  wait.message?.takeIf { wait.phase == WaitPhase.RETRYING }?.let {
+    Text(it, style = MaterialTheme.typography.bodySmall, color = SubText, modifier = Modifier.padding(top = 8.dp))
+  }
+  Spacer(Modifier.size(16.dp))
+  if (wait.running) {
+    SecondaryAction("结束等车") { scope.launch { application.stopWait() } }
+    Text("结束不会触发出门提醒，也不会另发异常通知。", style = MaterialTheme.typography.bodySmall, color = SubText)
+  } else {
+    SecondaryAction("去关注项") { application.showCurrent(false) }
+  }
+}
+
+/** 首页留白与原生层级，不以规则文字堆叠替代主状态。 */@Composable
 private fun EmptyState(title: String, body: String) {
   Column(Modifier.fillMaxWidth().padding(top = 65.dp, bottom = 35.dp), verticalArrangement = Arrangement.spacedBy(0.dp)) {
     // D 原型空状态：66dp soft 色块 + 浅柠图标，22dp 圆角。
