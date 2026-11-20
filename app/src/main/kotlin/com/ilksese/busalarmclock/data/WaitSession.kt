@@ -60,6 +60,8 @@ class WaitSession(
   /** 本轮是否已经触发过出门提醒：一次等车最多一次，后续预测变化不重置。 */
   private var alert: AlertSnapshot? = task.alert
   private val confirmed: Boolean = task.alertConfirmed
+  private var lines: List<SavedLine> =
+    runCatching { Json.decodeFromString<List<SavedLine>>(task.linesJson) }.getOrDefault(emptyList())
   @Volatile private var state = WaitState(
     running = true,
     taskId = task.id,
@@ -68,6 +70,7 @@ class WaitSession(
     stationName = task.stationName,
     walkMinutes = task.walkMinutes,
     bufferMinutes = task.bufferMinutes,
+    lines = lines.map { WaitingLine(it.lineName, it.endStationName, null, null, false, it.obsolete) },
     startedAt = task.startedAt,
     deadlineAt = task.deadlineAt,
     lastSuccessAt = task.lastSuccessAt,
@@ -77,8 +80,6 @@ class WaitSession(
   private val elapsedStartedAt = elapsedAtCreation - task.startedAt.delayUntil(wallAtCreation).coerceAtMost(MAX_WAIT)
   private val elapsedMonitorDeadline = elapsedStartedAt.plusDelay(task.startedAt.delayUntil(task.deadlineAt))
   private var elapsedLastSuccessAt = elapsedStartedAt.plusDelay(task.startedAt.delayUntil(task.lastSuccessAt ?: task.startedAt))
-  private var lines: List<SavedLine> =
-    runCatching { Json.decodeFromString<List<SavedLine>>(task.linesJson) }.getOrDefault(emptyList())
 
   fun start() {
     if (!alive()) return
@@ -136,7 +137,7 @@ class WaitSession(
             phase = if (candidates.isNotEmpty()) WaitPhase.ALERTED else phaseOf(arrivals),
             lines = lines.map { saved ->
               val arrival = arrivals[saved.identity].takeUnless { saved.obsolete }
-              WaitingLine(saved.lineName, saved.endStationName, arrival?.minutes, arrival?.stops, arrival?.arriving == true)
+              WaitingLine(saved.lineName, saved.endStationName, arrival?.minutes, arrival?.stops, arrival?.arriving == true, saved.obsolete)
             },
             lastSuccessAt = maxOf(state.lastSuccessAt ?: task.startedAt, snapshot.fetchedAt),
             nextAttemptAt = snapshot.nextAllowedAt,

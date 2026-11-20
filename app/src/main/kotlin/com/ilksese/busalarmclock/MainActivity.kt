@@ -13,25 +13,35 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import com.ilksese.busalarmclock.ui.theme.Accent
 import com.ilksese.busalarmclock.ui.theme.BodyText
 import com.ilksese.busalarmclock.ui.theme.DeepBlue
@@ -41,6 +51,8 @@ import com.ilksese.busalarmclock.ui.theme.SubText
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material3.*
@@ -48,6 +60,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
@@ -235,6 +248,21 @@ fun WatchItemsScreen(
   BackHandler(viewingAlertTask != null && state.currentPage && !state.adding) { viewingAlertTask = null }
   BackHandler(state.adding && !state.saving) { if (state.cameraActive) leaveCamera() else cancel() }
 
+  val preflight = state.preflight
+  val listed = state.wait.alerts
+  val viewingAlert = listed.firstOrNull { it.snapshot.taskId == viewingAlertTask }
+  val currentFailure = state.wait.endedReason?.takeIf {
+    it != WaitEndReason.ALERTED && it != WaitEndReason.ALERT_CONFIRMED
+  }
+  // 当前故障不被历史提醒遮挡；用户仍可明确点进未确认快照。
+  val alert = viewingAlert ?: if (!viewingAlertList && currentFailure == null && preflight == null) {
+    listed.firstOrNull { it.snapshot.taskId == state.wait.taskId }
+      ?: listed.firstOrNull { !it.confirmed }?.takeIf { !state.wait.running }
+  } else null
+  val monitoring = state.currentPage && !state.adding && !viewingAlertList && alert == null &&
+    preflight == null && currentFailure == null && state.wait.running && state.wait.stopCode != null
+  var waitingSheet by remember(state.wait.taskId, monitoring) { mutableStateOf<WaitingSheet?>(null) }
+
   Scaffold(
     topBar = {
       TopAppBar(
@@ -249,10 +277,17 @@ fun WatchItemsScreen(
     },
     bottomBar = {
       if (!state.adding) {
-        // D 原型底部导航：选中项是浅柠色胶囊 + 深石蓝图标，未选中为次文色。
-        Row(Modifier.fillMaxWidth().background(DeepBlue).padding(vertical = 7.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-          DNavigationItem("关注项", Icons.Default.Place, selected = !state.currentPage) { viewingAlertList = false; viewingAlertTask = null; application.showCurrent(false) }
-          DNavigationItem("当前等车", Icons.Default.Schedule, selected = state.currentPage) { viewingAlertList = false; viewingAlertTask = null; application.showCurrent(true) }
+        Column(Modifier.fillMaxWidth().background(DeepBlue).navigationBarsPadding()) {
+          if (monitoring) {
+            Box(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 10.dp)) {
+              SecondaryAction("结束本次等车") { waitingSheet = WaitingSheet.STOP }
+            }
+          }
+          // D 原型底部导航：选中项是浅柠色胶囊 + 深石蓝图标，未选中为次文色。
+          Row(Modifier.fillMaxWidth().padding(vertical = 7.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+            DNavigationItem("关注项", Icons.Default.Place, selected = !state.currentPage) { viewingAlertList = false; viewingAlertTask = null; application.showCurrent(false) }
+            DNavigationItem("当前等车", Icons.Default.Schedule, selected = state.currentPage) { viewingAlertList = false; viewingAlertTask = null; application.showCurrent(true) }
+          }
         }
       }
     },
@@ -353,17 +388,6 @@ fun WatchItemsScreen(
           item { TextButton(enabled = !state.saving, onClick = { cancel() }) { Text("取消，保持原状") } }
         }
         state.currentPage -> {
-          val preflight = state.preflight
-          val listed = state.wait.alerts
-          val viewingAlert = listed.firstOrNull { it.snapshot.taskId == viewingAlertTask }
-          val currentFailure = state.wait.endedReason?.takeIf {
-            it != WaitEndReason.ALERTED && it != WaitEndReason.ALERT_CONFIRMED
-          }
-          val ownAlert = listed.firstOrNull { it.snapshot.taskId == state.wait.taskId }
-          // 当前故障不被历史提醒遮挡；用户仍可明确点进未确认快照。
-          val alert = viewingAlert ?: if (!viewingAlertList && currentFailure == null && preflight == null) {
-            ownAlert ?: listed.firstOrNull { !it.confirmed }?.takeIf { !state.wait.running }
-          } else null
           item {
             Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
               when {
@@ -380,7 +404,11 @@ fun WatchItemsScreen(
                   },
                 )
                 currentFailure != null -> EmptyState("本次等车已结束", state.wait.message ?: currentFailure.message)
-                state.wait.stopCode != null -> WaitingPanel(state.wait, waitScope, application)
+                state.wait.stopCode != null && state.wait.running -> WaitingPanel(state.wait) { waitingSheet = WaitingSheet.DETAILS }
+                state.wait.stopCode != null -> {
+                  EmptyState("本次等车已结束", state.wait.message.orEmpty())
+                  SecondaryAction("去关注项") { application.showCurrent(false) }
+                }
                 else -> {
                   EmptyState("还没开始等车", "去关注项，选一个具体站台开始。")
                   SecondaryAction("去关注项") { application.showCurrent(false) }
@@ -451,6 +479,19 @@ fun WatchItemsScreen(
       }
       state.message?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(vertical = 12.dp)) } }
     }
+  }
+  if (monitoring) when (waitingSheet) {
+    WaitingSheet.DETAILS -> WaitingDetailsSheet(state.wait, onDismiss = { waitingSheet = null })
+    WaitingSheet.STOP -> WaitingSheetContent("结束本次等车？", onDismiss = { waitingSheet = null }) {
+      Text("结束后停止取数，不再触发本次出门提醒。", style = MaterialTheme.typography.bodySmall, color = SubText)
+      PrimaryAction("结束等车") {
+        val taskId = state.wait.taskId ?: return@PrimaryAction
+        waitingSheet = null
+        waitScope.launch { application.stopWait(taskId) }
+      }
+      SecondaryAction("继续等车") { waitingSheet = null }
+    }
+    null -> Unit
   }
   if (state.codes.isNotEmpty()) AlertDialog(
     onDismissRequest = { cancel() }, title = { Text("图片里有多个站台二维码") },
@@ -631,87 +672,141 @@ private fun WaitPreflightPanel(
   Text("本次最多监测 30 分钟；连续 5 分钟没有成功响应会自动结束。", style = MaterialTheme.typography.bodySmall, color = SubText)
 }
 
-/** D 的 B 画面：状态胶囊、当前预计、标题与线路条；不含原型调试控件。 */
+private enum class WaitingSheet { DETAILS, STOP }
+
+/** D 的 B 画面：圆环只用于组织预测信息，不表示时间进度。 */
 @Composable
-private fun WaitingPanel(
-  wait: WaitState,
-  scope: kotlinx.coroutines.CoroutineScope,
-  application: WatchItemApplication,
-) {
-  val phase = wait.phase
-  val primary = wait.lines.firstOrNull { it.minutes != null }
-  Row(verticalAlignment = Alignment.CenterVertically) {
-    Box(Modifier.size(8.dp).background(if (wait.running) Accent else SubText, CircleShape))
-    Spacer(Modifier.width(8.dp))
-    Text(
-      if (!wait.running) (wait.endedReason?.let { "本次等车已结束" } ?: "本次等车已结束") else (phase?.label ?: WaitPhase.WAITING_FIRST.label),
-      style = MaterialTheme.typography.labelLarge,
-      color = if (wait.running) Accent else SubText,
-    )
+private fun WaitingPanel(wait: WaitState, onDetails: () -> Unit) {
+  val primary = wait.lines.mapNotNull { it.minutes }.minOrNull()
+  val (status, title, caption) = when {
+    wait.phase == WaitPhase.RETRYING -> Triple("获取失败，正在重试", "暂时连不上", "旧预测不会用于提醒")
+    wait.phase == WaitPhase.WAITING_FIRST || wait.phase == null ->
+      Triple("等待新预测", "正在看下一班", "开始前的缓存不会触发提醒")
+    wait.lines.isNotEmpty() && wait.lines.all { it.obsolete } ->
+      Triple("所选线路均已过时", "等待线路恢复", "未触发前仍可继续等候")
+    wait.phase == WaitPhase.MIGHT_BE_LATE ->
+      Triple("按当前预计可能来不及", "不催你赶\n这班车", "继续等待可用预测")
+    wait.phase == WaitPhase.FRESH && primary != null ->
+      Triple("正在监测", "还不用出门", "当前预计 · 不是倒计时")
+    else -> Triple("暂无有效预测", "暂时没有\n到站时间", "仍在监测，有新预测再判断")
   }
-  Spacer(Modifier.size(18.dp))
-  Text(
-    primary?.minutes?.toString() ?: "–",
-    style = MaterialTheme.typography.displayLarge,
-    color = BodyText,
-  )
-  Text(
-    if (primary == null) "暂无可用预测" else "分钟 · 当前预计 ${primary.lineName}",
-    style = MaterialTheme.typography.bodySmall,
-    color = SubText,
-  )
-  Spacer(Modifier.size(14.dp))
-  Text(wait.stationName.orEmpty(), style = MaterialTheme.typography.headlineMedium, color = BodyText)
+  val minutes = primary.takeIf { wait.phase == WaitPhase.FRESH }
+
+  Row(
+    Modifier.background(SoftSurface, RoundedCornerShape(20.dp)).padding(horizontal = 10.dp, vertical = 6.dp),
+    horizontalArrangement = Arrangement.spacedBy(7.dp),
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
+    Box(Modifier.size(6.dp).background(Accent, CircleShape))
+    Text(status, style = MaterialTheme.typography.labelSmall, color = Accent)
+  }
+  BoxWithConstraints(
+    Modifier.fillMaxWidth().padding(vertical = 14.dp),
+    contentAlignment = Alignment.Center,
+  ) {
+    val diameter = maxWidth.coerceAtMost(226.dp)
+    Canvas(Modifier.size(diameter)) {
+      val ringStroke = 1.dp.toPx()
+      val accentStroke = 3.dp.toPx()
+      val inset = size.minDimension * 13 / 240
+      val ringRadius = size.minDimension / 2 - inset
+      drawCircle(SubText.copy(alpha = 0.30f), radius = ringRadius, style = Stroke(ringStroke))
+      drawArc(Accent, startAngle = -90f, sweepAngle = 24f, useCenter = false,
+        topLeft = androidx.compose.ui.geometry.Offset(inset, inset),
+        size = androidx.compose.ui.geometry.Size(ringRadius * 2, ringRadius * 2),
+        style = Stroke(accentStroke, cap = StrokeCap.Round))
+    }
+    Column(
+      Modifier.width(diameter * 0.82f).heightIn(min = diameter + 11.dp),
+      horizontalAlignment = Alignment.CenterHorizontally,
+      verticalArrangement = Arrangement.Center,
+    ) {
+      Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.Bottom) {
+        Text(
+          minutes?.toString() ?: "—",
+          style = MaterialTheme.typography.displayLarge.copy(fontSize = 83.sp, lineHeight = 91.sp, fontWeight = FontWeight.Medium),
+          color = BodyText, maxLines = 1, softWrap = false,
+        )
+        if (minutes != null) Text("分钟", Modifier.padding(bottom = 14.dp), style = MaterialTheme.typography.bodyLarge, color = BodyText)
+      }
+      Text(caption, style = MaterialTheme.typography.bodySmall, color = SubText, textAlign = TextAlign.Center)
+    }
+  }
+  Text(title, Modifier.fillMaxWidth(), style = MaterialTheme.typography.headlineMedium,
+    color = BodyText, textAlign = TextAlign.Center)
   val walk = wait.walkMinutes
   val buffer = wait.bufferMinutes
   if (walk != null && buffer != null) {
-    Text(
-      "预计进入 ${formatMinutes(walk)}–${formatMinutes(walk + buffer)} 分钟时提醒你",
-      style = MaterialTheme.typography.bodySmall,
-      color = SubText,
-      modifier = Modifier.padding(top = 8.dp),
-    )
+    Text("预计进入 ${formatMinutes(walk)}–${formatMinutes(walk + buffer)} 分钟时提醒你",
+      modifier = Modifier.fillMaxWidth().padding(top = 10.dp), style = MaterialTheme.typography.bodySmall,
+      color = SubText, textAlign = TextAlign.Center)
   }
-  Spacer(Modifier.size(16.dp))
-  Column(Modifier.fillMaxWidth().background(SoftSurface, RoundedCornerShape(17.dp)).padding(16.dp)) {
-    wait.lines.forEach { line ->
-      Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        RouteTag(line.lineName)
-        Spacer(Modifier.width(11.dp))
-        Text("开往${line.endStationName}", style = MaterialTheme.typography.bodyMedium, color = BodyText)
-        Spacer(Modifier.weight(1f))
-        Text(
-          when {
-            line.arriving -> "即将到站"
-            line.minutes != null -> "${line.minutes} 分钟"
-            else -> "暂无预测"
-          },
-          style = MaterialTheme.typography.bodyMedium,
-          color = if (line.minutes != null) BodyText else SubText,
-        )
-      }
+  Spacer(Modifier.size(23.dp))
+  HorizontalDivider(color = Hairline)
+  Row(
+    Modifier.fillMaxWidth().heightIn(min = 72.dp).clickable(role = Role.Button, onClick = onDetails)
+      .semantics { contentDescription = "查看本次详情" }.padding(vertical = 10.dp),
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
+    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+      Text(wait.stationName.orEmpty(), style = MaterialTheme.typography.titleSmall, color = BodyText)
+      val lineNames = wait.lines.joinToString(" / ") { it.lineName }
+      Text("站台 ${wait.stopCode}${if (lineNames.isEmpty()) "" else " · $lineNames"}",
+        style = MaterialTheme.typography.bodySmall, color = SubText)
     }
+    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = BodyText)
   }
-  Spacer(Modifier.size(12.dp))
-  val lastSuccess = wait.lastSuccessAt
+  HorizontalDivider(color = Hairline)
   Text(
-    buildString {
-      append("最后成功：")
-      append(lastSuccess?.let { DateFormat.getTimeInstance().format(Date(it)) } ?: "尚未成功")
-      append(" · 请求间隔至少 60 秒")
-    },
-    style = MaterialTheme.typography.bodySmall,
-    color = SubText,
+    "最后成功：${wait.lastSuccessAt?.let { DateFormat.getTimeInstance().format(Date(it)) } ?: "尚未成功"} · 请求间隔至少 60 秒",
+    style = MaterialTheme.typography.bodySmall, color = SubText, modifier = Modifier.padding(top = 16.dp),
   )
   wait.message?.takeIf { wait.phase == WaitPhase.RETRYING }?.let {
     Text(it, style = MaterialTheme.typography.bodySmall, color = SubText, modifier = Modifier.padding(top = 8.dp))
   }
-  Spacer(Modifier.size(16.dp))
-  if (wait.running) {
-    SecondaryAction("结束等车") { scope.launch { application.stopWait() } }
-    Text("结束不会触发出门提醒，也不会另发异常通知。", style = MaterialTheme.typography.bodySmall, color = SubText)
-  } else {
-    SecondaryAction("去关注项") { application.showCurrent(false) }
+}
+
+/** D 的详情面板：主页面只放站台摘要，线路方向和每线预测在这里展开。 */
+@Composable
+private fun WaitingDetailsSheet(wait: WaitState, onDismiss: () -> Unit) {
+  WaitingSheetContent("本次等车", onDismiss) {
+    Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+      wait.walkMinutes?.let { Text("步行 ${formatMinutes(it)} 分钟", color = SubText) }
+      wait.bufferMinutes?.let { Text("余量 ${formatMinutes(it)} 分钟", color = SubText) }
+    }
+    wait.lines.forEach { line ->
+      HorizontalDivider(color = Hairline)
+      Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(11.dp)) {
+        RouteTag(line.lineName, enabled = !line.obsolete)
+        Column(Modifier.weight(1f)) {
+          Text("开往${line.endStationName}", style = MaterialTheme.typography.bodyMedium, color = if (line.obsolete) SubText else BodyText)
+          Text(when {
+            line.obsolete -> "过时 · 不参与提醒"
+            wait.phase == WaitPhase.RETRYING -> "旧预测不会用于提醒"
+            line.arriving -> "即将到站"
+            line.minutes != null -> "${line.minutes} 分钟"
+            else -> "暂无有效预计时间"
+          }, style = MaterialTheme.typography.bodySmall, color = SubText)
+        }
+      }
+    }
+  }
+}
+
+/** 等车页共用的原生底部面板，长线路列表可在面板内滚动。 */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun WaitingSheetContent(title: String, onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+  ModalBottomSheet(onDismissRequest = onDismiss, containerColor = DeepBlue) {
+    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(start = 22.dp, end = 22.dp, bottom = 24.dp),
+      verticalArrangement = Arrangement.spacedBy(12.dp)) {
+      Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(title, Modifier.weight(1f), style = MaterialTheme.typography.headlineSmall, color = BodyText)
+        IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, "关闭面板", tint = BodyText) }
+      }
+      content()
+    }
   }
 }
 

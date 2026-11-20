@@ -74,6 +74,7 @@ data class WaitingLine(
   val minutes: Int?,
   val stops: Int?,
   val arriving: Boolean,
+  val obsolete: Boolean = false,
 )
 
 data class WaitState(
