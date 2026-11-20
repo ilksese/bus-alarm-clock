@@ -44,6 +44,7 @@ class WaitSession(
   private val markAlertSubmitted: suspend () -> Boolean = { true },
   private val finishBeforeAlertDelivery: suspend (WaitEndReason, Long) -> Unit = { _, _ -> },
   private val requestDeadlineSleeper: suspend (Long) -> Unit = { delay(it) },
+  private val voiceEnabled: Boolean = true,
 ) {
   private val identity = AtomicLong(task.id)
   private val handoff = Mutex()
@@ -353,7 +354,7 @@ class WaitSession(
       if (!platform.notificationsAllowed()) return@withContext WaitEndReason.NOTIFICATIONS_UNAVAILABLE
       val duration = try {
         if (platform.canStartAlertOutput(task.id, ::remaining) && remaining() > 0) {
-          platform.startAlertOutput(task.id, ::remaining) { scope.launch(Dispatchers.Default) { finishOutput() } }
+          platform.startAlertOutput(alertSnapshot, voiceEnabled, ::remaining) { scope.launch(Dispatchers.Default) { finishOutput() } }
         } else 0L
       } catch (error: CancellationException) {
         throw error

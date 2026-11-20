@@ -398,7 +398,8 @@ fun WatchItemsScreen(
                   TextButton(onClick = { viewingAlertList = false }) { Text("返回当前等车") }
                 }
                 preflight != null -> WaitPreflightPanel(
-                  preflight, application, permissionPending, startMonitoring,
+                  preflight, application, state.voiceEnabled, permissionPending, startMonitoring,
+                  onStartWithoutVoice = { waitScope.launch { application.startWaitWithoutVoice() } },
                   onNotificationSettings = {
                     context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
                   },
@@ -433,6 +434,16 @@ fun WatchItemsScreen(
           }
         }
         else -> {
+          item {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+              Column(Modifier.weight(1f)) {
+                Text("出门提醒语音", color = BodyText)
+                Text("修改只影响下一次等车", style = MaterialTheme.typography.bodySmall, color = SubText)
+              }
+              Switch(checked = state.voiceEnabled, onCheckedChange = { enabled -> scope.launch { application.setVoiceEnabled(enabled) } },
+                modifier = Modifier.semantics { contentDescription = "出门提醒语音" })
+            }
+          }
           if (state.items.isEmpty()) item { EmptyState("下一站，\n从这里开始。", "点右上角加号，识别公交二维码并保存你的上车站台。") }
           if (state.items.isNotEmpty()) {
             item { SecondaryAction("核对线路最新状态", enabled = !state.loading && !state.saving) { scope.launch { application.refresh() } } }
@@ -602,10 +613,23 @@ private fun AlertPanel(
 private fun WaitPreflightPanel(
   draft: WaitPreflight,
   application: WatchItemApplication,
+  voiceEnabled: Boolean,
   permissionPending: Boolean,
   onStart: () -> Unit,
+  onStartWithoutVoice: () -> Unit,
   onNotificationSettings: () -> Unit,
 ) {
+  val context = androidx.compose.ui.platform.LocalContext.current
+  val scope = rememberCoroutineScope()
+  var preview by remember(draft.stopCode) { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+  val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+  DisposableEffect(lifecycle, draft.stopCode) {
+    val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+      if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) preview?.cancel()
+    }
+    lifecycle.addObserver(observer)
+    onDispose { lifecycle.removeObserver(observer); preview?.cancel() }
+  }
   Text(draft.stationName, style = MaterialTheme.typography.headlineSmall, color = BodyText)
   Text("站台 ${draft.stopCode}", style = MaterialTheme.typography.bodySmall, color = SubText)
   Spacer(Modifier.size(16.dp))
@@ -623,7 +647,7 @@ private fun WaitPreflightPanel(
       onValueChange = application::updateWalk,
       label = { Text("步行时间 W（分钟）") },
       singleLine = true,
-      enabled = !draft.starting,
+      enabled = !draft.starting && !draft.checkingVoice,
       modifier = Modifier.weight(1f),
     )
     Spacer(Modifier.width(12.dp))
@@ -632,7 +656,7 @@ private fun WaitPreflightPanel(
       onValueChange = application::updateBuffer,
       label = { Text("预留余量 B（分钟）") },
       singleLine = true,
-      enabled = !draft.starting,
+      enabled = !draft.starting && !draft.checkingVoice,
       modifier = Modifier.weight(1f),
     )
   }
@@ -656,18 +680,45 @@ private fun WaitPreflightPanel(
   }
   draft.error?.let { Text(it, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 12.dp)) }
   if (draft.notificationBlocked) TextButton(onClick = onNotificationSettings) { Text("打开通知设置") }
+  val enabled = !draft.starting && !draft.verifying && !draft.checkingVoice && !permissionPending
+  Text(if (voiceEnabled) "通知、铃声、震动和中文语音" else "通知、铃声和震动 · 语音关闭",
+    color = SubText, style = MaterialTheme.typography.bodySmall)
+  TextButton(enabled = enabled && preview == null, onClick = {
+    preview = scope.launch {
+      try { application.previewReminder() } finally { preview = null }
+    }
+  }) { Text(if (preview == null) "试听试震" else "正在试听试震…") }
+  draft.previewMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = SubText) }
+  if (draft.voiceUnavailable && voiceEnabled) {
+    Text("未找到已安装的中文语音。本次可以只使用通知、铃声和震动，之后仍会检查语音。", color = BodyText)
+    TextButton(onClick = {
+      preview?.cancel()
+      // 部分厂商没有独立的语音设置入口，只能回到系统设置让用户自行查找。
+      if (runCatching { context.startActivity(Intent("com.android.settings.TTS_SETTINGS")) }.isFailure) {
+        context.startActivity(Intent(Settings.ACTION_SETTINGS))
+      }
+    }) { Text("打开系统语音设置") }
+  }
   Spacer(Modifier.size(16.dp))
   PrimaryAction(
     when {
       permissionPending -> "等待通知授权…"
       draft.starting -> "正在开始…"
       draft.verifying -> "正在核对站台与线路…"
+      draft.voiceUnavailable && voiceEnabled -> "本次不用语音，开始监测"
       else -> "开始监测"
     },
-    enabled = !draft.starting && !draft.verifying && !permissionPending,
-    onClick = onStart,
+    enabled = enabled && preview == null,
+    onClick = if (draft.voiceUnavailable && voiceEnabled) onStartWithoutVoice else onStart,
   )
-  TextButton(enabled = !draft.starting && !draft.verifying && !permissionPending, onClick = application::dismissPreflight) { Text("取消") }
+  if (draft.voiceUnavailable && voiceEnabled) TextButton(enabled = enabled && preview == null,
+    onClick = { scope.launch { application.recheckChineseVoice() } }) {
+    Text(if (draft.checkingVoice) "正在检查中文语音…" else "重新检查中文语音")
+  }
+  TextButton(enabled = enabled, onClick = {
+    preview?.cancel()
+    application.dismissPreflight()
+  }) { Text("取消") }
   Text("等车提醒需要通知权限；开始前会联网核对站台与线路。", style = MaterialTheme.typography.bodySmall, color = SubText)
   Text("本次最多监测 30 分钟；连续 5 分钟没有成功响应会自动结束。", style = MaterialTheme.typography.bodySmall, color = SubText)
 }

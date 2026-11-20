@@ -123,6 +123,10 @@ interface WaitPlatform {
   fun submitAlert(alert: AlertSnapshot, remainingMillis: () -> Long): Boolean
   /** 额外的保守门槛，不代表 SystemUI 已展示。等待期间允许用户停止。 */
   suspend fun canStartAlertOutput(taskId: Long, remainingMillis: () -> Long): Boolean = true
+  suspend fun chineseVoiceAvailable(): Boolean = true
+  suspend fun previewReminder(voiceEnabled: Boolean): ReminderPreview = ReminderPreview()
+  suspend fun startAlertOutput(alert: AlertSnapshot, voiceEnabled: Boolean, remainingMillis: () -> Long, onInterrupted: () -> Unit): Long =
+    startAlertOutput(alert.taskId, remainingMillis, onInterrupted)
   fun startAlertOutput(taskId: Long, remainingMillis: () -> Long, onInterrupted: () -> Unit): Long = 0L
   fun stopAlertOutput(taskId: Long) = Unit
   /** 用户确认后撤下这条提醒的通知；按任务身份定位，不误撤新一轮的通知。 */
@@ -147,6 +151,15 @@ object HeadlessWaitPlatform : WaitPlatform {
   override fun clearAlert(taskId: Long) = Unit
 }
 
+/** 试听结果只记录平台已启动的输出，不代表用户已听见或感到震动。 */
+data class ReminderPreview(
+  val chime: Boolean = false,
+  val ringtone: Boolean = false,
+  val vibration: Boolean = false,
+  val voice: Boolean = false,
+  val interrupted: Boolean = false,
+)
+
 /** 开始前同屏核对：站台、已选线路、步行时间 W 与预留余量 B。 */
 data class WaitPreflight(
   val stopCode: String,
@@ -160,6 +173,9 @@ data class WaitPreflight(
   val notificationBlocked: Boolean = false,
   val error: String? = null,
   internal val verification: Any? = null,
+  val voiceUnavailable: Boolean = false,
+  val checkingVoice: Boolean = false,
+  val previewMessage: String? = null,
 ) {
   /** 首次必填且大于 0；不自动估算，也不接受空值。 */
   val walkMinutes: Double? get() = walkText.trim().toDoubleOrNull()?.takeIf { it.isFinite() && it > 0 }

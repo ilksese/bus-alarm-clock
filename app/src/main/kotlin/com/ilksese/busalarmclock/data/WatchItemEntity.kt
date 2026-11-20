@@ -62,8 +62,22 @@ interface WatchItemDao {
   suspend fun delete(stopCode: String)
 }
 
-@Database(entities = [WatchItemEntity::class, WaitTaskEntity::class, OutingAlertEntity::class], version = 7, exportSchema = false)
+/** 全局设置独立于关注项；缺少记录时采用首版默认值。 */
+@Entity(tableName = "reminder_settings")
+data class ReminderSettings(@PrimaryKey val slot: Int = 1, val voiceEnabled: Boolean = true)
+
+@Dao
+interface ReminderSettingsDao {
+  @Query("SELECT voiceEnabled FROM reminder_settings WHERE slot = 1")
+  suspend fun voiceEnabled(): Boolean?
+
+  @Insert(onConflict = OnConflictStrategy.REPLACE)
+  suspend fun save(settings: ReminderSettings)
+}
+
+@Database(entities = [WatchItemEntity::class, WaitTaskEntity::class, OutingAlertEntity::class, ReminderSettings::class], version = 8, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
   abstract fun watchItemDao(): WatchItemDao
   abstract fun waitTaskDao(): WaitTaskDao
+  abstract fun reminderSettingsDao(): ReminderSettingsDao
 }

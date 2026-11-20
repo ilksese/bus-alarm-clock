@@ -11,6 +11,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 
@@ -34,8 +35,28 @@ class WatchItemApplication(
   private val revision = java.util.concurrent.atomic.AtomicLong(0)
   private var session: WaitSession? = null
   private val taskIds = java.util.concurrent.atomic.AtomicLong(clock())
+  private val settingsLock = kotlinx.coroutines.sync.Mutex()
+
+  suspend fun setVoiceEnabled(enabled: Boolean) = settingsLock.withLock {
+    try {
+      withContext(Dispatchers.IO) { store.setVoiceEnabled(enabled) }
+      mutableState.update { it.copy(voiceEnabled = enabled, message = null) }
+    } catch (error: Exception) {
+      if (error is CancellationException) throw error
+      mutableState.update { it.copy(message = "语音设置保存失败，仍使用原设置。") }
+    }
+  }
 
   suspend fun open() {
+    settingsLock.withLock {
+      try {
+        val enabled = withContext(Dispatchers.IO) { store.voiceEnabled() }
+        mutableState.update { it.copy(voiceEnabled = enabled) }
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        mutableState.update { it.copy(message = "语音设置读取失败，请重试。") }
+      }
+    }
     try {
       val openingItems = state.value.items
       val liveTaskId = session?.current()?.takeIf { it.running }?.taskId
@@ -190,11 +211,15 @@ class WatchItemApplication(
   }
 
   fun updateWalk(text: String) = mutableState.update { state ->
-    state.preflight?.let { state.copy(preflight = it.copy(walkText = text, error = null)) } ?: state
+    state.preflight?.takeUnless { it.starting || it.checkingVoice }?.let {
+      state.copy(preflight = it.copy(walkText = text, error = null))
+    } ?: state
   }
 
   fun updateBuffer(text: String) = mutableState.update { state ->
-    state.preflight?.let { state.copy(preflight = it.copy(bufferText = text, error = null)) } ?: state
+    state.preflight?.takeUnless { it.starting || it.checkingVoice }?.let {
+      state.copy(preflight = it.copy(bufferText = text, error = null))
+    } ?: state
   }
 
   fun dismissPreflight() {
@@ -211,8 +236,13 @@ class WatchItemApplication(
   /** 开始前的联网核对：允许复用 60 秒内成功结果，但始终展示原始获取时间。 */
   suspend fun verifyWait() { verifyWait(state.value.preflight ?: return) }
 
+  private fun isVerificationFresh(fetchedAt: Long?): Boolean {
+    val now = clock()
+    return fetchedAt != null && fetchedAt <= now && fetchedAt.delayUntil(now) < REFRESH_INTERVAL
+  }
+
   private suspend fun verifyWait(draft: WaitPreflight): WaitPreflight? {
-    if (draft.verifying || draft.starting) return null
+    if (draft.verifying || draft.starting || draft.checkingVoice) return null
     val verification = Any()
     val checking = state.value
     if (checking.preflight !== draft || !mutableState.compareAndSet(checking,
@@ -222,14 +252,13 @@ class WatchItemApplication(
       val available = snapshot.value.lines.map { it.direction }.toSet()
       val verified = mutableState.updateAndGet { state ->
         val current = state.preflight?.takeIf { it.verification === verification } ?: return@updateAndGet state
-        val missing = current.lines.none { line -> !line.obsolete && line.direction in available }
-        state.copy(
-          preflight = current.copy(
-            verifying = false,
-            verifiedAt = snapshot.fetchedAt.takeUnless { missing },
-            error = if (missing) "该站台已没有你选择的线路，请先回到关注项重新选线" else null,
-          ),
-        )
+        val error = when {
+          !isVerificationFresh(snapshot.fetchedAt) -> "线路核对结果已过期，请稍后重试。"
+          current.lines.none { !it.obsolete && it.direction in available } -> "该站台已没有你选择的线路，请先回到关注项重新选线"
+          else -> null
+        }
+        state.copy(preflight = current.copy(verifying = false,
+          verifiedAt = snapshot.fetchedAt.takeIf { error == null }, error = error))
       }.preflight
       return verified?.takeIf { it.verification === verification && it.verifiedAt != null }
     } catch (error: Exception) {
@@ -246,9 +275,56 @@ class WatchItemApplication(
   /** 由可见页面手动开始一次有限等车；任一前置条件不满足都不假启动。 */
   suspend fun startWait() { startWait(state.value.preflight ?: return) }
 
-  private suspend fun startWait(draft: WaitPreflight) {
+  /** 重查只更新当前核对页，不代表用户同意开始监测。 */
+  suspend fun recheckChineseVoice() {
     val current = state.value
-    if (current.preflight !== draft || draft.starting || draft.verifying) return
+    val draft = current.preflight?.takeIf { current.voiceEnabled && it.voiceUnavailable && !it.starting && !it.verifying } ?: return
+    val checking = draft.copy(checkingVoice = true)
+    if (draft.checkingVoice || !mutableState.compareAndSet(current, current.copy(preflight = checking))) return
+    var available = false
+    try {
+      available = platform.chineseVoiceAvailable()
+    } catch (error: CancellationException) {
+      throw error
+    } catch (_: Exception) {
+      // 引擎连接失败也按不可用处理；下次仍可重查。
+    } finally {
+      mutableState.update { state ->
+        if (state.preflight !== checking) state
+        else state.copy(preflight = draft.copy(voiceUnavailable = !available && state.voiceEnabled))
+      }
+    }
+  }
+
+  suspend fun previewReminder() {
+    val current = state.value
+    val draft = current.preflight?.takeUnless { it.starting || it.verifying || it.checkingVoice } ?: return
+    val message = try {
+      val includeVoice = current.voiceEnabled && !draft.voiceUnavailable
+      val result = platform.previewReminder(includeVoice)
+      buildList {
+        add(if (result.interrupted) "试听已中断" else "试听试震结束")
+        add(if (result.chime) "已启动提示音" else "未播放提示音")
+        add(if (result.ringtone) "已启动铃声" else "未播放铃声")
+        add(if (result.vibration) "已启动试震" else "未试震")
+        if (current.voiceEnabled) add(if (result.voice) "中文语音已播报" else "中文语音未能播报")
+      }.joinToString("；", postfix = "。")
+    } catch (error: CancellationException) {
+      throw error
+    } catch (_: Exception) {
+      "试听试震未能完成，请检查系统设置。"
+    }
+    mutableState.update { if (it.preflight === draft) it.copy(preflight = draft.copy(previewMessage = message)) else it }
+  }
+
+  suspend fun startWaitWithoutVoice() {
+    val draft = state.value.preflight?.takeIf { it.voiceUnavailable } ?: return
+    startWait(draft, withoutVoice = true)
+  }
+
+  private suspend fun startWait(draft: WaitPreflight, withoutVoice: Boolean = false) {
+    val current = state.value
+    if (current.preflight !== draft || draft.starting || draft.verifying || draft.checkingVoice) return
     if (current.wait.running) {
       mutableState.update { it.copy(preflight = draft.copy(error = "已有一轮等车在运行，先结束它再开始。")) }
       return
@@ -271,13 +347,30 @@ class WatchItemApplication(
       mutableState.update { it.copy(preflight = draft.copy(notificationBlocked = true, error = "通知总开关或出门提醒类别已关闭，无法保证提醒，未开始监测")) }
       return
     }
-    if (draft.verifiedAt == null) {
-      // 未核对过就必须先联网核对；核对失败不会进入启动分支。
+    if (!isVerificationFresh(draft.verifiedAt)) {
+      // 降级确认可能停留很久；继续走同一来源的共享请求门控。
       val verified = verifyWait(draft) ?: return
       // 核对成功仅能继续同一份草稿，不能把随后打开的站台自动启动。
-      return startWait(verified)
+      return startWait(verified, withoutVoice)
     }
-    if (!mutableState.compareAndSet(current, current.copy(preflight = draft.copy(starting = true, notificationBlocked = false, error = null)))) return
+    val starting = draft.copy(starting = true, notificationBlocked = false, voiceUnavailable = false, error = null)
+    if (!mutableState.compareAndSet(current, current.copy(preflight = starting))) return
+    val voiceEnabled = current.voiceEnabled && !withoutVoice
+    try {
+      if (voiceEnabled && !platform.chineseVoiceAvailable()) {
+        mutableState.update { if (it.preflight === starting) it.copy(preflight = draft.copy(voiceUnavailable = true, error = null)) else it }
+        return
+      }
+    } catch (error: CancellationException) {
+      mutableState.update { if (it.preflight === starting) it.copy(preflight = draft) else it }
+      throw error
+    }
+    if (state.value.preflight !== starting) return
+    if (!platform.notificationsAllowed()) {
+      mutableState.update { if (it.preflight === starting) it.copy(preflight = draft.copy(notificationBlocked = true,
+        error = "通知已关闭，未开始监测。")) else it }
+      return
+    }
     // W/B 保存到关注项；保存失败不假启动。
     try {
       val item = withContext(Dispatchers.IO) { store.find(draft.stopCode) }
@@ -289,6 +382,12 @@ class WatchItemApplication(
     } catch (error: Exception) {
       if (error is CancellationException) throw error
       mutableState.update { it.copy(preflight = draft.copy(starting = false, error = "本机保存失败，未开始监测：${error.message ?: "请重试"}")) }
+      return
+    }
+    if (state.value.preflight !== starting) return
+    if (!isVerificationFresh(draft.verifiedAt)) {
+      mutableState.update { if (it.preflight === starting) it.copy(preflight = draft.copy(verifiedAt = null,
+        error = "线路核对结果已过期，请重试。")) else it }
       return
     }
     val now = clock()
@@ -339,6 +438,7 @@ class WatchItemApplication(
       finishBeforeAlertDelivery = { reason, endedAt ->
         withContext(Dispatchers.IO) { tasks.finishBeforeAlertDelivery(task.id, reason, endedAt) }
       },
+      voiceEnabled = voiceEnabled,
     )
     session = running
     mutableState.update { it.copy(wait = running.current().copy(alerts = it.wait.alerts)) }
@@ -797,6 +897,7 @@ data class WatchItemsState(
   val cameraActive: Boolean = false,
   val preflight: WaitPreflight? = null,
   val wait: WaitState = WaitState(),
+  val voiceEnabled: Boolean = true,
 )
 
 /** 数据替换仅在统一应用边界进行；生产实现始终访问同一 Room 数据库。 */
@@ -805,4 +906,6 @@ interface WatchItemStore {
   suspend fun save(item: WatchItemEntity)
   suspend fun delete(stopCode: String)
   suspend fun all(): List<WatchItemEntity>
+  suspend fun voiceEnabled(): Boolean = true
+  suspend fun setVoiceEnabled(enabled: Boolean) = Unit
 }

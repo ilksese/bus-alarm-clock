@@ -12,7 +12,7 @@ import kotlinx.serialization.json.Json
 object DatabaseProvider {
   fun create(context: Context): AppDatabase =
     Room.databaseBuilder(context, AppDatabase::class.java, "bus-alarm-clock.db")
-      .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+      .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
       .build()
 }
 
@@ -22,6 +22,8 @@ class RoomWatchItemStore(private val database: AppDatabase) : WatchItemStore {
   override suspend fun save(item: WatchItemEntity) = database.watchItemDao().save(item)
   override suspend fun delete(stopCode: String) = database.watchItemDao().delete(stopCode)
   override suspend fun all() = database.watchItemDao().observeAll().first()
+  override suspend fun voiceEnabled() = database.reminderSettingsDao().voiceEnabled() ?: true
+  override suspend fun setVoiceEnabled(enabled: Boolean) = database.reminderSettingsDao().save(ReminderSettings(voiceEnabled = enabled))
 }
 
 /** 提醒快照仍在 Room；独立提交凭据用于 Room 提交标记写失败后的恢复。 */
