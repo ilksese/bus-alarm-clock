@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 为系统主题图标保留车窗和时钟的镂空，避免单色处理后变成实心色块。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M43,29h18q5,0 8,2q-5,5 -2,12q1.5,3 5,4v16q0,6 -5,8v5q0,3 -3,3h-1q-3,0 -3,-3v-4H44v4q0,3 -3,3h-1q-3,0 -3,-3v-5q-5,-2 -5,-8v-9h-2q-2,0 -2,-2v-5q0,-3 3,-3h1v-4q1,-11 11,-11zM42,38h8v15h-8q-5,0 -5,-4v-7q0,-4 5,-4zM54,38h7q1,5 6,9v2q0,4 -5,4h-8zM40,58a3,3 0,1 1,0 6a3,3 0,1 1,0 -6zM64,58a3,3 0,1 1,0 6a3,3 0,1 1,0 -6zM47,60q5,4 10,0q-1,8 -5,8q-4,0 -5,-8zM75,30a9,9 0,1 1,0 18a9,9 0,1 1,0 -18zM73.8,33.5h2.4v4.8l3.2,2.3l-1.4,2l-4.2,-3z" />
+</vector>
