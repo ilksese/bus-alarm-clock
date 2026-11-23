@@ -12,7 +12,7 @@ import kotlinx.serialization.json.Json
 object DatabaseProvider {
   fun create(context: Context): AppDatabase =
     Room.databaseBuilder(context, AppDatabase::class.java, "bus-alarm-clock.db")
-      .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+      .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
       .build()
 }
 
@@ -22,6 +22,8 @@ class RoomWatchItemStore(private val database: AppDatabase) : WatchItemStore {
   override suspend fun save(item: WatchItemEntity) = database.watchItemDao().save(item)
   override suspend fun delete(stopCode: String) = database.watchItemDao().delete(stopCode)
   override suspend fun all() = database.watchItemDao().observeAll().first()
+  override suspend fun voiceEnabled() = database.reminderSettingsDao().voiceEnabled() ?: true
+  override suspend fun setVoiceEnabled(enabled: Boolean) = database.reminderSettingsDao().save(ReminderSettings(voiceEnabled = enabled))
 }
 
 /** 提醒快照仍在 Room；独立提交凭据用于 Room 提交标记写失败后的恢复。 */
@@ -32,13 +34,16 @@ class RoomWaitTaskStore(
   private val dao get() = database.waitTaskDao()
   private fun hasReceipt(id: Long) = receipts?.getBoolean(id.toString(), false) == true
 
-  override suspend fun load(): WaitTask? = dao.load()?.let { row ->
+  override suspend fun load(): WaitTask? = dao.load()?.let { readableTask(it) }
+
+  private suspend fun readableTask(row: WaitTaskEntity): WaitTask =
     if (row.alertJson != null && !hasReceipt(row.id) && !dao.wasAlertSubmitted(row.id)) {
       row.copy(alertJson = null, alertConfirmed = false).toTask()
     } else row.toTask()
-  }
 
-  override suspend fun save(task: WaitTask) = dao.write(task.toEntity())
+  override suspend fun save(task: WaitTask) = dao.save(task.toEntity())
+
+  override suspend fun latestResult(): WaitTask? = dao.latestResult()?.let { readableTask(it) }
 
   override suspend fun progress(id: Long, phase: WaitPhase, lastSuccessAt: Long?) =
     dao.progress(id, phase.name, lastSuccessAt)
@@ -70,7 +75,16 @@ class RoomWaitTaskStore(
 
   override suspend fun confirmAlert(id: Long) = dao.confirmAlert(id, hasReceipt(id))
 
-  override suspend fun confirmPostedAlert(id: Long) = dao.confirmAlert(id, true)
+  override suspend fun confirmPostedAlert(id: Long): Boolean {
+    val confirmed = dao.confirmAlert(id, true)
+    if (confirmed) return true
+    dao.markAlertSubmitted(id)
+    return dao.confirmAlert(id, true)
+  }
+
+  override suspend fun discardPendingAlert(id: Long) {
+    if (!hasReceipt(id)) dao.discardPendingAlert(id)
+  }
 
   override suspend fun finishBeforeAlertDelivery(id: Long, reason: WaitEndReason, endedAt: Long) =
     if (hasReceipt(id)) dao.finish(id, reason.name, endedAt)
