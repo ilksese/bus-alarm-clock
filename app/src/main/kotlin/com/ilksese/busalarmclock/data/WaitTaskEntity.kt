@@ -15,8 +15,8 @@ import androidx.room.Upsert
  */
 @Entity(tableName = "wait_tasks")
 data class WaitTaskEntity(
-  /** 同一时刻只允许一轮等车，因此固定占一行。 */
-  @PrimaryKey val slot: Int = SINGLE_SLOT,
+  /** 运行槽与最近结束槽各最多一行，不保留历史列表。 */
+  @PrimaryKey val slot: Int = CURRENT_SLOT,
   val id: Long,
   val stopCode: String,
   val stationName: String,
@@ -33,7 +33,10 @@ data class WaitTaskEntity(
   @ColumnInfo(defaultValue = "NULL") val alertJson: String? = null,
   @ColumnInfo(defaultValue = "0") val alertConfirmed: Boolean = false,
 ) {
-  companion object { const val SINGLE_SLOT = 1 }
+  companion object {
+    const val CURRENT_SLOT = 1
+    const val RESULT_SLOT = 2
+  }
 }
 
 /** 快照独立于当前任务槽位；换一轮等车不会覆盖旧通知所指向的记录。 */
@@ -50,10 +53,22 @@ interface WaitTaskDao {
   @Query("SELECT * FROM wait_tasks WHERE slot = 1")
   suspend fun load(): WaitTaskEntity?
 
+  @Query("SELECT * FROM wait_tasks WHERE slot = 2 OR (slot = 1 AND endedReason IS NOT NULL) ORDER BY slot LIMIT 1")
+  suspend fun latestResult(): WaitTaskEntity?
+
   @Upsert
   suspend fun write(task: WaitTaskEntity)
 
-  @Query("DELETE FROM wait_tasks WHERE id = :id")
+  @Transaction
+  suspend fun save(task: WaitTaskEntity) {
+    val previous = load()
+    if (previous?.endedReason != null && previous.id != task.id) {
+      write(previous.copy(slot = WaitTaskEntity.RESULT_SLOT))
+    }
+    write(task)
+  }
+
+  @Query("DELETE FROM wait_tasks WHERE slot = 1 AND id = :id")
   suspend fun clear(id: Long)
 
   @Query("SELECT * FROM outing_alerts ORDER BY taskId DESC")
@@ -97,6 +112,13 @@ interface WaitTaskDao {
 
   @Query("DELETE FROM outing_alerts WHERE taskId = :id AND submitted = 0 AND confirmed = 0")
   suspend fun deletePendingAlert(id: Long): Int
+
+  @Transaction
+  suspend fun discardPendingAlert(id: Long) {
+    if (deletePendingAlert(id) == 0) return
+    val current = load()
+    if (current?.id == id) write(current.copy(alertJson = null))
+  }
 
   /** 先结束的轮次不能留下未交付的快照，晚到的 recordAlert 也会拒绝写入。 */
   @Transaction

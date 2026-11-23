@@ -19,12 +19,14 @@ import android.os.VibrationEffect
 import android.os.VibrationAttributes
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.ilksese.busalarmclock.MainActivity
 import com.ilksese.busalarmclock.R
 import com.ilksese.busalarmclock.data.AlertSnapshot
+import com.ilksese.busalarmclock.data.ReminderPreview
 import com.ilksese.busalarmclock.data.WaitEndReason
 import com.ilksese.busalarmclock.data.WaitPlatform
 import com.ilksese.busalarmclock.data.WaitState
@@ -34,11 +36,17 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** 应用级通知开关与出门提醒类别：任一关闭都不能保证提醒。 */
 private const val PREFS = "bus_alarm_clock"
@@ -50,14 +58,21 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
   private val postingLock = Any()
   @Volatile private var slotOwner: Long? = null
   private val output = AtomicReference<AlertOutput?>(null)
+  private val outputHandoff = Any()
+  private var outputOperations = 0
+  private var outputStopUnverified = false
+  private var vibrationMayContinueUntil = 0L
   private val vibrationLock = Any()
   private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
   /** Only local handles are synchronized: Android service calls must not hold the cleanup gate. */
   private class AlertOutput(val owner: Long) {
     val player = AtomicReference<MediaPlayer?>(null)
+    val speech = AtomicReference<ChineseSpeech?>(null)
+    val chimeEnded = CompletableDeferred<Unit>()
     val toneOwner = AtomicBoolean(true)
     @Volatile var vibrator: Vibrator? = null
+    @Volatile var vibrationUntil: Long = 0
     val focus = AtomicReference<AudioFocusRequest?>(null)
     @Volatile var listener: AudioManager.OnModeChangedListener? = null
   }
@@ -232,6 +247,271 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
   private fun outsideDnd(): Boolean = context.getSystemService(NotificationManager::class.java)
     ?.currentInterruptionFilter == NotificationManager.INTERRUPTION_FILTER_ALL
 
+  override suspend fun chineseVoiceAvailable(): Boolean = withContext(Dispatchers.IO) {
+    checkVoice {
+      val speech = ChineseSpeech(context)
+      try { speech.prepare(2_000) } finally { releaseSpeech(speech, stopFirst = false) }
+    }
+  }
+
+  override suspend fun startAlertOutput(
+    alert: AlertSnapshot,
+    voiceEnabled: Boolean,
+    remainingMillis: () -> Long,
+    onInterrupted: () -> Unit,
+  ): Long {
+    beginOutputOperation()
+    if (remainingMillis() <= 0L) {
+      finishOutputOperation()
+      return 0
+    }
+    try {
+      return playAlert(alert, voiceEnabled, remainingMillis, onInterrupted)
+    } finally {
+      finishOutputOperation()
+    }
+  }
+
+  private suspend fun playAlert(alert: AlertSnapshot, voiceEnabled: Boolean, remainingMillis: () -> Long, onInterrupted: () -> Unit): Long {
+    val first = startAlertOutput(alert.taskId, remainingMillis, onInterrupted)
+    if (first == 0L) return 0
+    val carrier = output.get()?.takeIf { it.owner == alert.taskId && it.player.get() != null } ?: return first
+    val manager = audio ?: return first
+    fun ready() = output.get() === carrier && carrier.toneOwner.get() && remainingMillis() > 25L &&
+      audioAllowed(manager) && notificationsAllowed() && slotContains(alert.taskId) && channelAllowsSound()
+
+    // 在音频焦点丢失时，独立等已发出的短震自然结束，不重新启动任何声音。
+    return try {
+      if (!awaitWhileAllowed(1_000, ::ready) { carrier.chimeEnded.await() }) return 0
+      if (voiceEnabled && ready()) {
+        val text = "${alert.main.lineName}，开往${alert.main.endStationName}，${alert.stationName}，站台编号${alert.stopCode.toList().joinToString(" ")}，预计${formatAlertEta(alert.main.etaSeconds)}到站，该出门了。"
+        val speech = speakChinese(carrier.speech, text, remainingMillis, ::ready)
+        if (!speech.spoken && ready()) Log.w("BusAlarmClock", "本次中文语音未能播报")
+        if (!speech.safeToContinue) return 0
+      }
+      if (!ready()) return 0
+      val ring = createRingtone() ?: return 0
+      val chime = carrier.player.get()
+      if (chime == null || !carrier.player.compareAndSet(chime, ring)) {
+        ring.release()
+        return 0
+      }
+      releasePlayer(chime)
+      ring.isLooping = true
+      if (!ready()) return 0
+      ring.start()
+      while (ready()) delay(minOf(50L, remainingMillis()).coerceAtLeast(1))
+      0
+    } finally {
+      val vibrationLeft = carrier.vibrationUntil - SystemClock.elapsedRealtime()
+      if (vibrationLeft > 0) delay(minOf(vibrationLeft, remainingMillis()))
+    }
+  }
+
+  private fun createRingtone(): MediaPlayer? {
+    val uri = RingtoneManager.getActualDefaultRingtoneUri(context, RingtoneManager.TYPE_RINGTONE) ?: return null
+    val player = MediaPlayer()
+    return try {
+      player.setAudioAttributes(alertAudioAttributes)
+      player.setDataSource(context, uri)
+      player.prepare()
+      player
+    } catch (_: Exception) {
+      player.release()
+      null
+    }
+  }
+
+  private fun beginOutputOperation() { synchronized(outputHandoff) { outputOperations++ } }
+
+  private fun finishOutputOperation(stopped: Boolean = true) {
+    synchronized(outputHandoff) {
+      if (!stopped) outputStopUnverified = true
+      outputOperations--
+    }
+  }
+
+  override suspend fun awaitPreviousOutput(): Boolean = withTimeoutOrNull(1_000) {
+    while (true) {
+      val idle = synchronized(outputHandoff) {
+        if (outputStopUnverified) return@withTimeoutOrNull false
+        outputOperations == 0 && output.get() == null && SystemClock.elapsedRealtime() >= vibrationMayContinueUntil
+      }
+      if (idle && WaitRuntime.outputReleased()) break
+      delay(10)
+    }
+    true
+  } ?: false
+
+  private fun releasePlayer(player: MediaPlayer) {
+    beginOutputOperation()
+    cleanupScope.launch { finishOutputOperation(runCatching { player.release() }.isSuccess) }
+  }
+
+  private suspend fun awaitWhileAllowed(timeout: Long, allowed: () -> Boolean, await: suspend () -> Unit): Boolean =
+    coroutineScope {
+      val completion = async { await() }
+      val completed = withTimeoutOrNull(timeout) {
+        while (!completion.isCompleted && allowed()) delay(25)
+        completion.isCompleted && allowed()
+      } ?: false
+      completion.cancel()
+      completed
+    }
+
+  private data class SpeechOutcome(val spoken: Boolean, val safeToContinue: Boolean)
+
+  private suspend fun speakChinese(
+    holder: AtomicReference<ChineseSpeech?>,
+    text: String,
+    remainingMillis: () -> Long,
+    allowed: () -> Boolean,
+  ): SpeechOutcome {
+    if (!allowed()) return SpeechOutcome(false, false)
+    val speech = try { ChineseSpeech(context) } catch (_: Exception) { return SpeechOutcome(false, true) }
+    holder.set(speech)
+    var result = ChineseSpeech.Result.FAILED
+    var cleanup: kotlinx.coroutines.Deferred<Boolean>? = null
+    try {
+      // 探测失败没有发起播报；已进入 speak 却没有终态时，必须按可能仍在发声处理。
+      if (allowed() && checkVoice { speech.prepare(minOf(2_000, remainingMillis())) }) {
+        result = ChineseSpeech.Result.UNKNOWN
+        val reported = AtomicReference(ChineseSpeech.Result.UNKNOWN)
+        val ended = awaitWhileAllowed(minOf(10_000, remainingMillis()), allowed) {
+          reported.set(speech.speak(text, alertAudioAttributes, minOf(10_000, remainingMillis()), allowed))
+        }
+        if (ended) result = reported.get()
+      }
+    } catch (error: CancellationException) {
+      throw error
+    } catch (_: Exception) {
+      // 语音调用异常不等于引擎已停止，沿同一条保守收尾路径处理。
+    } finally {
+      if (holder.compareAndSet(speech, null)) {
+        cleanup = releaseSpeech(speech, stopFirst = result == ChineseSpeech.Result.UNKNOWN)
+      }
+    }
+    val safe = if (result != ChineseSpeech.Result.UNKNOWN) true else {
+      withTimeoutOrNull(minOf(250L, remainingMillis())) { cleanup?.await() } == true
+    }
+    return SpeechOutcome(result == ChineseSpeech.Result.SPOKEN, safe)
+  }
+
+  /** 仅等待停止结果，shutdown 慢时不能挡住已获准的续铃。 */
+  private fun releaseSpeech(speech: ChineseSpeech, stopFirst: Boolean): kotlinx.coroutines.Deferred<Boolean> {
+    val stopped = CompletableDeferred<Boolean>()
+    if (stopFirst) beginOutputOperation()
+    cleanupScope.launch {
+      try {
+        stopped.complete(!stopFirst || withTimeoutOrNull(250) { speech.stopAndAwait() } == true)
+      } catch (_: Exception) {
+        stopped.complete(false)
+      } finally {
+        // 续铃只信停止回调；任务交接也可依靠已经返回的断开连接。
+        val released = runCatching { speech.shutdown() }.isSuccess
+        if (stopFirst) finishOutputOperation(released || stopped.await())
+      }
+    }
+    return stopped
+  }
+
+  override suspend fun previewReminder(voiceEnabled: Boolean): ReminderPreview = withContext(Dispatchers.IO) {
+    val manager = audio ?: return@withContext ReminderPreview()
+    val notifications = context.getSystemService(NotificationManager::class.java) ?: return@withContext ReminderPreview()
+    fun settings() = notifications.getNotificationChannel(WaitNotifications.ALERT_CHANNEL_ID)
+    fun ready() = outsideDnd() && output.get() == null && settings()?.importance != NotificationManager.IMPORTANCE_NONE
+    fun canVibrate() = ready() && manager.ringerMode != AudioManager.RINGER_MODE_SILENT && settings()?.shouldVibrate() != false
+    if (!ready()) return@withContext ReminderPreview()
+    coroutineScope {
+      val vibration = async {
+        if (!canVibrate()) return@async false
+        val vibrator = context.getSystemService(VibratorManager::class.java)?.defaultVibrator ?: return@async false
+        synchronized(vibrationLock) {
+          if (!canVibrate() || !vibrator.hasVibrator()) return@async false
+          vibrator.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE),
+            VibrationAttributes.createForUsage(VibrationAttributes.USAGE_NOTIFICATION))
+        }
+        try {
+          awaitWhileAllowed(250, ::canVibrate) { delay(200) }
+          true
+        } finally {
+          synchronized(vibrationLock) { if (output.get()?.vibrator == null) vibrator.cancel() }
+        }
+      }
+      val interrupted = AtomicBoolean(false)
+      fun canPlay(): Boolean {
+        val channel = settings()
+        return !interrupted.get() && ready() && audioAllowed(manager) && (channel == null || channel.sound != null)
+      }
+      var result = ReminderPreview()
+      if (canPlay()) {
+        val focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+          .setAudioAttributes(alertAudioAttributes)
+          .setWillPauseWhenDucked(true)
+          .setOnAudioFocusChangeListener { change -> if (change < 0) interrupted.set(true) }
+          .build()
+        val listener = AudioManager.OnModeChangedListener { mode ->
+          if (mode != AudioManager.MODE_NORMAL) interrupted.set(true)
+        }
+        if (manager.requestAudioFocus(focus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+          try {
+            manager.addOnModeChangedListener(ContextCompat.getMainExecutor(context), listener)
+            val player = MediaPlayer.create(context, R.raw.outing_chime, alertAudioAttributes, AudioManager.AUDIO_SESSION_ID_GENERATE)
+            var chimeEnded = false
+            if (player != null) try {
+              val ended = CompletableDeferred<Unit>()
+              player.setOnCompletionListener { ended.complete(Unit) }
+              if (canPlay()) {
+                player.start()
+                result = result.copy(chime = true)
+                chimeEnded = awaitWhileAllowed(1_000, ::canPlay) { ended.await() }
+              }
+            } finally { releasePlayer(player) }
+            if (chimeEnded && canPlay()) {
+              val deadline = SystemClock.elapsedRealtime() + 5_000L
+              val voice = if (voiceEnabled) speakChinese(AtomicReference(null), "这是一条出门提醒试听。",
+                { (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L) }, ::canPlay)
+              else SpeechOutcome(false, true)
+              result = result.copy(voice = voice.spoken)
+              if (voice.safeToContinue && canPlay()) createRingtone()?.let { ring ->
+                try {
+                  if (canPlay()) {
+                    ring.isLooping = true
+                    ring.start()
+                    result = result.copy(ringtone = true)
+                    awaitWhileAllowed(1_000, ::canPlay) { delay(750) }
+                  }
+                } finally { releasePlayer(ring) }
+              }
+            }
+            result = result.copy(interrupted = !canPlay())
+          } finally {
+            manager.removeOnModeChangedListener(listener)
+            manager.abandonAudioFocusRequest(focus)
+          }
+        }
+      }
+      result.copy(vibration = vibration.await())
+    }
+  }
+
+  private suspend fun checkVoice(block: suspend () -> Boolean): Boolean = try {
+    block()
+  } catch (error: CancellationException) {
+    throw error
+  } catch (_: Exception) {
+    false
+  }
+
+  private val alertAudioAttributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION_EVENT).build()
+
+  private fun audioAllowed(manager: AudioManager): Boolean = outsideDnd() &&
+    manager.mode == AudioManager.MODE_NORMAL && manager.ringerMode == AudioManager.RINGER_MODE_NORMAL &&
+    manager.getStreamVolume(AudioManager.STREAM_NOTIFICATION) > 0
+
+  private fun channelAllowsSound() = context.getSystemService(NotificationManager::class.java)
+    ?.getNotificationChannel(WaitNotifications.ALERT_CHANNEL_ID)?.sound != null
+
   override fun startAlertOutput(taskId: Long, remainingMillis: () -> Long, onInterrupted: () -> Unit): Long {
     if (!notificationsAllowed() || !slotContains(taskId) || !outsideDnd() || remainingMillis() <= 0L) return 0
     val manager = audio ?: return 0
@@ -241,14 +521,9 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
     val carrier = AlertOutput(taskId)
     if (!output.compareAndSet(null, carrier)) return 0
     fun active() = output.get() === carrier && remainingMillis() > 0
-    fun interrupt() {
-      if (output.get() !== carrier) return
-      stopAlertOutput(taskId)
-      onInterrupted()
-    }
     if (!active()) { stopAlertOutput(taskId); return 0 }
     val listener = AudioManager.OnModeChangedListener { mode ->
-      if (mode != AudioManager.MODE_NORMAL) interrupt()
+      if (mode != AudioManager.MODE_NORMAL) stopSound(carrier)
     }
     manager.addOnModeChangedListener(ContextCompat.getMainExecutor(context), listener)
     carrier.listener = listener
@@ -258,10 +533,10 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
       return 0
     }
     val toneDuration = if (settings.sound != null && ringerMode() == AudioManager.RINGER_MODE_NORMAL) {
-      runCatching { playAlertTone(carrier, manager, remainingMillis, ::interrupt) }.getOrDefault(0L)
+      runCatching { playAlertTone(carrier, manager, remainingMillis, onInterrupted) }.getOrDefault(0L)
     } else 0L
-    if (toneDuration == 0L) stopAlertTone(carrier)
-    val vibrationDuration = if (active() && settings.shouldVibrate() && manager.mode == AudioManager.MODE_NORMAL &&
+    if (toneDuration == 0L) stopSound(carrier)
+    val vibrationDuration = if (active() && settings.shouldVibrate() && outsideDnd() &&
       (ringerMode() == AudioManager.RINGER_MODE_NORMAL || ringerMode() == AudioManager.RINGER_MODE_VIBRATE)) {
       runCatching { vibrateAlert(carrier, remainingMillis) }.getOrDefault(0L)
     } else 0L
@@ -272,26 +547,27 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
     if (manager.getStreamVolume(AudioManager.STREAM_NOTIFICATION) == 0) return 0
     val owner = carrier.owner
     val service = WaitRuntime.service?.takeIf { it.owns(owner) } ?: return 0
-    val attributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION_EVENT).build()
-    // 短音不循环，原生播放器也有一份独立的时长上限。
+    val attributes = alertAudioAttributes
+    // 使用播放器回调衔接语音；短音自身不循环。
     val player = MediaPlayer.create(context, R.raw.outing_chime, attributes, AudioManager.AUDIO_SESSION_ID_GENERATE) ?: return 0
     carrier.player.set(player)
+    player.setOnCompletionListener { carrier.chimeEnded.complete(Unit) }
     val duration = player.duration.toLong()
     if (duration !in 1L..250L) return 0
-    fun ready() = output.get() === carrier && remainingMillis() >= duration + 25L
+    fun ready() = output.get() === carrier && carrier.toneOwner.get() && remainingMillis() >= duration + 25L && audioAllowed(manager)
     if (!ready() || manager.mode != AudioManager.MODE_NORMAL || !notificationsAllowed() || !slotContains(owner)) return 0
     val focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
       .setAudioAttributes(attributes)
       .setWillPauseWhenDucked(true)
       .setOnAudioFocusChangeListener { change ->
-        if (change < 0 && carrier.toneOwner.get()) onInterrupted()
+        if (change < 0) stopSound(carrier)
       }.build()
     if (!ready() || manager.requestAudioFocus(focus) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) return 0
     carrier.focus.set(focus)
     if (manager.mode != AudioManager.MODE_NORMAL || !notificationsAllowed() || !slotContains(owner) || !ready()) return 0
     // player 已准备完毕且焦点已获准；提升在 IO 上，独立看门狗不等它返回。
-    if (!service.promoteForPlayback(owner, ::ready) || !ready()) {
-      onInterrupted()
+    if (!service.promoteForPlayback(owner, ::ready)) {
+      if (ready()) onInterrupted()
       return 0
     }
     if (manager.mode != AudioManager.MODE_NORMAL || !notificationsAllowed() || !slotContains(owner) || !ready()) return 0
@@ -300,12 +576,23 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
     return (endsAt - SystemClock.elapsedRealtime()).coerceAtLeast(0)
   }
 
-  private fun stopAlertTone(carrier: AlertOutput) {
-    carrier.toneOwner.set(false)
-    val player = carrier.player.getAndSet(null)
-    runCatching { player?.release() }
-    carrier.focus.getAndSet(null)?.let { focus ->
-      cleanupScope.launch { runCatching { audio?.abandonAudioFocusRequest(focus) } }
+  private fun stopSound(carrier: AlertOutput) {
+    // 在摘下句柄前登记，避免交接先于清理协程看到空闲。
+    beginOutputOperation()
+    try {
+      carrier.toneOwner.set(false)
+      carrier.chimeEnded.complete(Unit)
+      carrier.speech.getAndSet(null)?.let { releaseSpeech(it, stopFirst = true) }
+      carrier.player.getAndSet(null)?.let(::releasePlayer)
+      carrier.focus.getAndSet(null)?.let { focus ->
+        beginOutputOperation()
+        cleanupScope.launch {
+          try { runCatching { audio?.abandonAudioFocusRequest(focus) } }
+          finally { finishOutputOperation() }
+        }
+      }
+    } finally {
+      finishOutputOperation()
     }
   }
 
@@ -316,23 +603,38 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
       val duration = minOf(200L, remainingMillis() - 25L)
       if (duration <= 0 || output.get() !== carrier) return@synchronized 0L
       carrier.vibrator = vibrator
-      vibrator.vibrate(VibrationEffect.createOneShot(duration, VibrationEffect.DEFAULT_AMPLITUDE),
-        VibrationAttributes.createForUsage(VibrationAttributes.USAGE_NOTIFICATION))
+      // Binder 返回后再计算自然停止上界，避免失败取消时过早放行下一轮。
+      try {
+        vibrator.vibrate(VibrationEffect.createOneShot(duration, VibrationEffect.DEFAULT_AMPLITUDE),
+          VibrationAttributes.createForUsage(VibrationAttributes.USAGE_NOTIFICATION))
+      } finally {
+        carrier.vibrationUntil = SystemClock.elapsedRealtime() + duration
+      }
       duration
     }
   }
 
   override fun stopAlertOutput(taskId: Long) {
-    val carrier = output.get()?.takeIf { it.owner == taskId } ?: return
-    if (!output.compareAndSet(carrier, null)) return
-    // Independent cleanup paths: an audio or vibrator Binder must not delay service and lock release.
-    cleanupScope.launch { stopAlertTone(carrier) }
+    val carrier = synchronized(outputHandoff) {
+      val current = output.get()?.takeIf { it.owner == taskId } ?: return
+      if (!output.compareAndSet(current, null)) return
+      outputOperations++
+      current
+    }
+    // 分别释放音频和震动；语音引擎的 IPC 不能拖住其它资源收尾。
+    stopSound(carrier)
     carrier.listener?.let { listener -> cleanupScope.launch { runCatching { audio?.removeOnModeChangedListener(listener) } } }
     cleanupScope.launch {
-      synchronized(vibrationLock) {
-        // 取消是进程级操作；旧任务不能取消新一轮已发出的震动。
-        if (output.get()?.vibrator == null) runCatching { carrier.vibrator?.cancel() }
+      val stopped = runCatching {
+        synchronized(vibrationLock) {
+          // 取消是进程级操作；旧任务不能取消新一轮已发出的震动。
+          if (output.get()?.vibrator == null) carrier.vibrator?.cancel()
+        }
+      }.isSuccess
+      if (!stopped) synchronized(outputHandoff) {
+        vibrationMayContinueUntil = maxOf(vibrationMayContinueUntil, carrier.vibrationUntil)
       }
+      finishOutputOperation()
     }
   }
 
@@ -353,7 +655,9 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
 
   override suspend fun startForegroundService(taskId: Long): Boolean {
     if (!WaitRuntime.requestStart(taskId)) return false
-    return runCatching { ContextCompat.startForegroundService(context, WaitService.start(context, taskId)) }.isSuccess
+    val started = runCatching { ContextCompat.startForegroundService(context, WaitService.start(context, taskId)) }.isSuccess
+    if (!started) WaitRuntime.stopService(taskId)
+    return started
   }
 
   override fun stopForegroundService(taskId: Long) {
