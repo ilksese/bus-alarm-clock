@@ -58,6 +58,10 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
   private val postingLock = Any()
   @Volatile private var slotOwner: Long? = null
   private val output = AtomicReference<AlertOutput?>(null)
+  private val outputHandoff = Any()
+  private var outputOperations = 0
+  private var outputStopUnverified = false
+  private var vibrationMayContinueUntil = 0L
   private val vibrationLock = Any()
   private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -256,6 +260,19 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
     remainingMillis: () -> Long,
     onInterrupted: () -> Unit,
   ): Long {
+    beginOutputOperation()
+    if (remainingMillis() <= 0L) {
+      finishOutputOperation()
+      return 0
+    }
+    try {
+      return playAlert(alert, voiceEnabled, remainingMillis, onInterrupted)
+    } finally {
+      finishOutputOperation()
+    }
+  }
+
+  private suspend fun playAlert(alert: AlertSnapshot, voiceEnabled: Boolean, remainingMillis: () -> Long, onInterrupted: () -> Unit): Long {
     val first = startAlertOutput(alert.taskId, remainingMillis, onInterrupted)
     if (first == 0L) return 0
     val carrier = output.get()?.takeIf { it.owner == alert.taskId && it.player.get() != null } ?: return first
@@ -305,7 +322,31 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
     }
   }
 
-  private fun releasePlayer(player: MediaPlayer) { cleanupScope.launch { runCatching { player.release() } } }
+  private fun beginOutputOperation() { synchronized(outputHandoff) { outputOperations++ } }
+
+  private fun finishOutputOperation(stopped: Boolean = true) {
+    synchronized(outputHandoff) {
+      if (!stopped) outputStopUnverified = true
+      outputOperations--
+    }
+  }
+
+  override suspend fun awaitPreviousOutput(): Boolean = withTimeoutOrNull(1_000) {
+    while (true) {
+      val idle = synchronized(outputHandoff) {
+        if (outputStopUnverified) return@withTimeoutOrNull false
+        outputOperations == 0 && output.get() == null && SystemClock.elapsedRealtime() >= vibrationMayContinueUntil
+      }
+      if (idle && WaitRuntime.outputReleased()) break
+      delay(10)
+    }
+    true
+  } ?: false
+
+  private fun releasePlayer(player: MediaPlayer) {
+    beginOutputOperation()
+    cleanupScope.launch { finishOutputOperation(runCatching { player.release() }.isSuccess) }
+  }
 
   private suspend fun awaitWhileAllowed(timeout: Long, allowed: () -> Boolean, await: suspend () -> Unit): Boolean =
     coroutineScope {
@@ -359,13 +400,16 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
   /** 仅等待停止结果，shutdown 慢时不能挡住已获准的续铃。 */
   private fun releaseSpeech(speech: ChineseSpeech, stopFirst: Boolean): kotlinx.coroutines.Deferred<Boolean> {
     val stopped = CompletableDeferred<Boolean>()
+    if (stopFirst) beginOutputOperation()
     cleanupScope.launch {
       try {
         stopped.complete(!stopFirst || withTimeoutOrNull(250) { speech.stopAndAwait() } == true)
       } catch (_: Exception) {
         stopped.complete(false)
       } finally {
-        runCatching { speech.shutdown() }
+        // 续铃只信停止回调；任务交接也可依靠已经返回的断开连接。
+        val released = runCatching { speech.shutdown() }.isSuccess
+        if (stopFirst) finishOutputOperation(released || stopped.await())
       }
     }
     return stopped
@@ -533,12 +577,22 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
   }
 
   private fun stopSound(carrier: AlertOutput) {
-    carrier.toneOwner.set(false)
-    carrier.chimeEnded.complete(Unit)
-    carrier.speech.getAndSet(null)?.let { releaseSpeech(it, stopFirst = true) }
-    carrier.player.getAndSet(null)?.let(::releasePlayer)
-    carrier.focus.getAndSet(null)?.let { focus ->
-      cleanupScope.launch { runCatching { audio?.abandonAudioFocusRequest(focus) } }
+    // 在摘下句柄前登记，避免交接先于清理协程看到空闲。
+    beginOutputOperation()
+    try {
+      carrier.toneOwner.set(false)
+      carrier.chimeEnded.complete(Unit)
+      carrier.speech.getAndSet(null)?.let { releaseSpeech(it, stopFirst = true) }
+      carrier.player.getAndSet(null)?.let(::releasePlayer)
+      carrier.focus.getAndSet(null)?.let { focus ->
+        beginOutputOperation()
+        cleanupScope.launch {
+          try { runCatching { audio?.abandonAudioFocusRequest(focus) } }
+          finally { finishOutputOperation() }
+        }
+      }
+    } finally {
+      finishOutputOperation()
     }
   }
 
@@ -549,24 +603,38 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
       val duration = minOf(200L, remainingMillis() - 25L)
       if (duration <= 0 || output.get() !== carrier) return@synchronized 0L
       carrier.vibrator = vibrator
-      carrier.vibrationUntil = SystemClock.elapsedRealtime() + duration
-      vibrator.vibrate(VibrationEffect.createOneShot(duration, VibrationEffect.DEFAULT_AMPLITUDE),
-        VibrationAttributes.createForUsage(VibrationAttributes.USAGE_NOTIFICATION))
+      // Binder 返回后再计算自然停止上界，避免失败取消时过早放行下一轮。
+      try {
+        vibrator.vibrate(VibrationEffect.createOneShot(duration, VibrationEffect.DEFAULT_AMPLITUDE),
+          VibrationAttributes.createForUsage(VibrationAttributes.USAGE_NOTIFICATION))
+      } finally {
+        carrier.vibrationUntil = SystemClock.elapsedRealtime() + duration
+      }
       duration
     }
   }
 
   override fun stopAlertOutput(taskId: Long) {
-    val carrier = output.get()?.takeIf { it.owner == taskId } ?: return
-    if (!output.compareAndSet(carrier, null)) return
+    val carrier = synchronized(outputHandoff) {
+      val current = output.get()?.takeIf { it.owner == taskId } ?: return
+      if (!output.compareAndSet(current, null)) return
+      outputOperations++
+      current
+    }
     // 分别释放音频和震动；语音引擎的 IPC 不能拖住其它资源收尾。
     stopSound(carrier)
     carrier.listener?.let { listener -> cleanupScope.launch { runCatching { audio?.removeOnModeChangedListener(listener) } } }
     cleanupScope.launch {
-      synchronized(vibrationLock) {
-        // 取消是进程级操作；旧任务不能取消新一轮已发出的震动。
-        if (output.get()?.vibrator == null) runCatching { carrier.vibrator?.cancel() }
+      val stopped = runCatching {
+        synchronized(vibrationLock) {
+          // 取消是进程级操作；旧任务不能取消新一轮已发出的震动。
+          if (output.get()?.vibrator == null) carrier.vibrator?.cancel()
+        }
+      }.isSuccess
+      if (!stopped) synchronized(outputHandoff) {
+        vibrationMayContinueUntil = maxOf(vibrationMayContinueUntil, carrier.vibrationUntil)
       }
+      finishOutputOperation()
     }
   }
 
@@ -587,7 +655,9 @@ class AndroidWaitPlatform(private val context: Context) : WaitPlatform {
 
   override suspend fun startForegroundService(taskId: Long): Boolean {
     if (!WaitRuntime.requestStart(taskId)) return false
-    return runCatching { ContextCompat.startForegroundService(context, WaitService.start(context, taskId)) }.isSuccess
+    val started = runCatching { ContextCompat.startForegroundService(context, WaitService.start(context, taskId)) }.isSuccess
+    if (!started) WaitRuntime.stopService(taskId)
+    return started
   }
 
   override fun stopForegroundService(taskId: Long) {

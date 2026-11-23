@@ -5,6 +5,7 @@ import java.math.BigDecimal
 /** 一次等车的结束原因；用户主动停止不属于异常，不另发提示。 */
 enum class WaitEndReason(val message: String) {
   CANCELLED("已主动取消，未触发出门提醒；不另发异常通知。"),
+  CANCELLED_DURING_DELIVERY("已主动结束等车；结束时提醒仍在提交，无法确认是否展示。"),
   MAX_DURATION("已到未触发上限，本次等车结束；需要时请重新开始。"),
   NO_SUCCESS("连续 5 分钟没有成功响应，本次等车结束。"),
   AUTH_FAILED("来源要求重新认证，本次等车结束。"),
@@ -14,6 +15,7 @@ enum class WaitEndReason(val message: String) {
   NOTIFICATIONS_UNAVAILABLE("通知权限或出门提醒类别已关闭，本次等车结束。请开启后重新开始。"),
   INTERRUPTED("上次等车被系统中断，没有继续监测，也没有补发提醒。"),
   ALERTED("出门提醒已触发；尚未确认，不会自动重响。"),
+  ALERT_OUTPUT_INTERRUPTED("出门提醒已提交，但输出可能在结束前中断；不会自动重响。"),
   ALERT_CONFIRMED("出门提醒已确认，本次输出已停止。"),
 }
 
@@ -129,6 +131,8 @@ interface WaitPlatform {
     startAlertOutput(alert.taskId, remainingMillis, onInterrupted)
   fun startAlertOutput(taskId: Long, remainingMillis: () -> Long, onInterrupted: () -> Unit): Long = 0L
   fun stopAlertOutput(taskId: Long) = Unit
+  /** 新任务不接手尚未完成的旧输出清理。 */
+  suspend fun awaitPreviousOutput(): Boolean = true
   /** 用户确认后撤下这条提醒的通知；按任务身份定位，不误撤新一轮的通知。 */
   fun clearAlert(taskId: Long)
   /** 未能持久记录投递时，确认系统撤回后才可清理快照。 */
@@ -183,6 +187,8 @@ data class WaitPreflight(
   val bufferMinutes: Double? get() = bufferText.trim().toDoubleOrNull()?.takeIf { it.isFinite() && it >= 0 }
 }
 
+data class WaitResult(val taskId: Long, val stationName: String, val reason: WaitEndReason)
+
 /** 一次等车的最少持久状态；用于下次打开时解释中断，不做自动恢复。 */
 data class WaitTask(
   val id: Long,
@@ -209,6 +215,7 @@ data class WaitTask(
  */
 interface WaitTaskStore {
   suspend fun load(): WaitTask?
+  suspend fun latestResult(): WaitTask? = load()?.takeIf { it.endedReason != null }
   /** 关键状态保存失败必须抛错，调用方据此拒绝启动。 */
   suspend fun save(task: WaitTask)
   suspend fun progress(id: Long, phase: WaitPhase, lastSuccessAt: Long?)
@@ -221,6 +228,7 @@ interface WaitTaskStore {
   /** Room 提交标记写入前，独立保留同步通知提交的凭据。 */
   fun recordSubmissionReceipt(id: Long) = Unit
   suspend fun markAlertSubmitted(id: Long): Boolean
+  suspend fun discardPendingAlert(id: Long) = Unit
   suspend fun finishBeforeAlertDelivery(id: Long, reason: WaitEndReason, endedAt: Long)
   /** 提醒确认：只确认属于这一轮的那条提醒，旧提醒动作不影响新任务。 */
   suspend fun confirmAlert(id: Long): Boolean

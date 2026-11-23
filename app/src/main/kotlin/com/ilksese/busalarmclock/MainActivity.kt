@@ -59,6 +59,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.semantics.contentDescription
@@ -179,18 +180,20 @@ fun WatchItemsScreen(
   val hasNotificationPermission = {
     context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
   }
-  var permissionPending by remember { mutableStateOf(false) }
+  val permissionPending = state.notificationPermissionDraft != null
   val permissionResult: (Boolean) -> Unit = { granted ->
-    permissionPending = false
-    if (granted) waitScope.launch { application.startWait() }
-    else application.notificationPermissionDenied()
+    val expected = application.takeNotificationPermissionDraft()
+    if (expected != null) {
+      if (granted) waitScope.launch { application.startWait(expected) }
+      else application.notificationPermissionDenied(expected)
+    }
   }
   val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission(), permissionResult)
   val startMonitoring = {
+    val expected = state.preflight
     if (hasNotificationPermission()) {
-      waitScope.launch { application.startWait() }
-    } else if (!permissionPending) {
-      permissionPending = true
+      waitScope.launch { application.startWait(expected) }
+    } else if (expected != null && application.beginNotificationPermission(expected)) {
       if (notificationPermissionRequest != null) notificationPermissionRequest(permissionResult)
       else notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
@@ -397,13 +400,16 @@ fun WatchItemsScreen(
                   if (listed.none { !it.confirmed }) Text("没有未确认的出门提醒")
                   TextButton(onClick = { viewingAlertList = false }) { Text("返回当前等车") }
                 }
-                preflight != null -> WaitPreflightPanel(
-                  preflight, application, state.voiceEnabled, permissionPending, startMonitoring,
-                  onStartWithoutVoice = { waitScope.launch { application.startWaitWithoutVoice() } },
-                  onNotificationSettings = {
-                    context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
-                  },
-                )
+                preflight != null -> {
+                  if (state.wait.running) Text("${state.wait.stationName}仍在等车，确认切换前不会结束。", color = SubText)
+                  WaitPreflightPanel(
+                    preflight, application, state.voiceEnabled, permissionPending, state.wait.running, startMonitoring,
+                    onStartWithoutVoice = { waitScope.launch { application.startWaitWithoutVoice() } },
+                    onNotificationSettings = {
+                      context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
+                    },
+                  )
+                }
                 currentFailure != null -> EmptyState("本次等车已结束", state.wait.message ?: currentFailure.message)
                 state.wait.stopCode != null && state.wait.running -> WaitingPanel(state.wait) { waitingSheet = WaitingSheet.DETAILS }
                 state.wait.stopCode != null -> {
@@ -444,13 +450,22 @@ fun WatchItemsScreen(
                 modifier = Modifier.semantics { contentDescription = "出门提醒语音" })
             }
           }
+          state.latestResult?.let { result ->
+            item {
+              Text("上次等车 · ${result.stationName}", color = BodyText, style = MaterialTheme.typography.titleSmall)
+              Text(result.reason.message, color = SubText, style = MaterialTheme.typography.bodySmall)
+            }
+          }
           if (state.items.isEmpty()) item { EmptyState("下一站，\n从这里开始。", "点右上角加号，识别公交二维码并保存你的上车站台。") }
           if (state.items.isNotEmpty()) {
             item { SecondaryAction("核对线路最新状态", enabled = !state.loading && !state.saving) { scope.launch { application.refresh() } } }
           }
           state.items.forEach { item ->
             item(key = item.stopCode) {
-              Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(top = 19.dp, bottom = 23.dp)) {
+              Column(
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.testTag("watch-item-${item.stopCode}").padding(top = 19.dp, bottom = 23.dp),
+              ) {
                 Text(item.stationName, style = MaterialTheme.typography.headlineSmall, color = BodyText)
                 Text("站台 ${item.stopCode} · ${item.selectedLines.size} 条已选线路", style = MaterialTheme.typography.bodySmall, color = SubText)
                 item.selectedLines.forEach { line ->
@@ -473,11 +488,15 @@ fun WatchItemsScreen(
                 )
                 Button(
                   onClick = { viewingAlertList = false; viewingAlertTask = null; application.prepareWait(item.stopCode) },
-                  enabled = !state.wait.running,
+                  enabled = !state.saving && state.preflight?.starting != true,
                   shape = RoundedCornerShape(17.dp),
                   contentPadding = PaddingValues(vertical = 12.dp, horizontal = 16.dp),
                   modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                ) { Text(if (state.wait.running) "已有一轮等车在运行" else "开始等车", style = MaterialTheme.typography.labelLarge) }
+                ) { Text(when {
+                  !state.wait.running -> "开始等车"
+                  state.wait.stopCode == item.stopCode -> "查看当前等车"
+                  else -> "切换到此站台"
+                }, style = MaterialTheme.typography.labelLarge) }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                   TextButton(enabled = !state.saving, onClick = { scope.launch { application.edit(item.stopCode) } }) { Text("编辑选线") }
                   TextButton(enabled = !state.saving, onClick = { application.requestDelete(item.stopCode) }) { Text("删除关注项") }
@@ -509,14 +528,33 @@ fun WatchItemsScreen(
     text = { Column { state.codes.forEach { code -> TextButton(onClick = { scope.launch { application.importCode(code) } }) { Text("站台码 $code") } } } },
     confirmButton = {}, dismissButton = { TextButton(onClick = { cancel() }) { Text("取消") } },
   )
-  state.deleting?.let { stopCode ->
-    val item = state.items.firstOrNull { it.stopCode == stopCode }
+  state.waitChange?.let { change ->
+    val action = when (change.action) {
+      WaitChangeAction.REPLACE -> "切换到新站台"
+      WaitChangeAction.EDIT -> "编辑选线"
+      WaitChangeAction.SAVE -> "保存修改"
+      WaitChangeAction.REMOVE_RECORD -> "删除线路记录"
+    }
+    val busy = state.waitChangeCommitting || state.saving || state.preflight?.starting == true || state.preflight?.verifying == true
     AlertDialog(
-      onDismissRequest = { application.cancelDelete() },
+      onDismissRequest = { application.cancelWaitChange(change) },
+      title = { Text("结束当前等车并$action？") },
+      text = { Text("将停止 ${state.wait.stationName.orEmpty()} 的监测和提醒输出；旧的未确认提醒仍可查看。") },
+      confirmButton = { TextButton(enabled = !busy, onClick = { waitScope.launch { application.confirmWaitChange(change) } }) { Text("结束并$action") } },
+      dismissButton = { TextButton(enabled = !busy, onClick = { application.cancelWaitChange(change) }) { Text("取消") } },
+    )
+  }
+  state.deleting?.let { deletion ->
+    val item = state.items.firstOrNull { it.stopCode == deletion.stopCode }
+    AlertDialog(
+      onDismissRequest = { application.cancelDelete(deletion) },
       title = { Text("删除关注项") },
-      text = { Text("将删除站台 $stopCode 的关注项与已保存的 ${item?.selectedLines?.size ?: 0} 条线路记录，不会开始或结束任何等车。") },
-      confirmButton = { TextButton(onClick = { scope.launch { application.confirmDelete() } }) { Text("确认删除") } },
-      dismissButton = { TextButton(onClick = { application.cancelDelete() }) { Text("取消") } },
+      text = { Text("将删除站台 ${deletion.stopCode} 的关注项与已保存的 ${item?.selectedLines?.size ?: 0} 条线路记录。" +
+        if (deletion.taskId != null) "删除前会结束本次等车及提醒输出。" else "不会影响其他站台的等车。") },
+      confirmButton = { TextButton(enabled = !state.saving, onClick = { waitScope.launch { application.confirmDelete(deletion) } }) {
+        Text(if (deletion.taskId != null) "结束并删除" else "确认删除")
+      } },
+      dismissButton = { TextButton(enabled = !state.saving, onClick = { application.cancelDelete(deletion) }) { Text("取消") } },
     )
   }
 }
@@ -615,6 +653,7 @@ private fun WaitPreflightPanel(
   application: WatchItemApplication,
   voiceEnabled: Boolean,
   permissionPending: Boolean,
+  oldWaitRunning: Boolean,
   onStart: () -> Unit,
   onStartWithoutVoice: () -> Unit,
   onNotificationSettings: () -> Unit,
@@ -683,7 +722,7 @@ private fun WaitPreflightPanel(
   val enabled = !draft.starting && !draft.verifying && !draft.checkingVoice && !permissionPending
   Text(if (voiceEnabled) "通知、铃声、震动和中文语音" else "通知、铃声和震动 · 语音关闭",
     color = SubText, style = MaterialTheme.typography.bodySmall)
-  TextButton(enabled = enabled && preview == null, onClick = {
+  TextButton(enabled = enabled && preview == null && !oldWaitRunning, onClick = {
     preview = scope.launch {
       try { application.previewReminder() } finally { preview = null }
     }

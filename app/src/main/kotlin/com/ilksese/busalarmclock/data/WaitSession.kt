@@ -45,6 +45,7 @@ class WaitSession(
   private val finishBeforeAlertDelivery: suspend (WaitEndReason, Long) -> Unit = { _, _ -> },
   private val requestDeadlineSleeper: suspend (Long) -> Unit = { delay(it) },
   private val voiceEnabled: Boolean = true,
+  private val submissionHandoff: Mutex = Mutex(),
 ) {
   private val identity = AtomicLong(task.id)
   private val handoff = Mutex()
@@ -58,6 +59,7 @@ class WaitSession(
   /** 输出期计时任务；到限或确认时取消，旧计时不会改写后来的状态。 */
   private var outputJob: Job? = null
   private var submissionJob: Job? = null
+  private var outputInterrupted = false
   /** 本轮是否已经触发过出门提醒：一次等车最多一次，后续预测变化不重置。 */
   private var alert: AlertSnapshot? = task.alert
   private val confirmed: Boolean = task.alertConfirmed
@@ -262,44 +264,9 @@ class WaitSession(
       return false
     }
     val receiptSaved = withContext(Dispatchers.IO + NonCancellable) {
-      // 不持会话锁，也不占主线程；即使 Binder 无法中止，截止仍能停服务。
-      if (remaining() <= 0 || !platform.notificationsAllowed() || !submission.compareAndSet(Submission.PENDING, Submission.POSTING)) return@withContext null
-      if (!runCatching { platform.submitAlert(alertSnapshot, ::remaining) }.getOrDefault(false)) {
-        if (!submission.compareAndSet(Submission.POSTING, Submission.PENDING) &&
-          submission.compareAndSet(Submission.CLOSED, Submission.WITHDRAWN)) {
-          runCatching { finishBeforeAlertDelivery(WaitEndReason.ALERT_DELIVERY_FAILED, clock()) }
-        }
-        return@withContext null
+      submissionHandoff.withLock {
+        submitPendingAlert(alertSnapshot, ::remaining)
       }
-      // 截止可独立停服，但不能在 Binder 返回前删其可能引用的快照。
-      if (remaining() <= 0 || !submission.compareAndSet(Submission.POSTING, Submission.POSTED)) {
-        // 确认和撤回竞争同一状态；确认已接管时，迟到提交不得撤通知或删快照。
-        val mayWithdraw = submission.compareAndSet(Submission.POSTING, Submission.WITHDRAWN) ||
-          submission.compareAndSet(Submission.CLOSED, Submission.WITHDRAWN)
-        if (!mayWithdraw) return@withContext null
-        if (platform.withdrawAlert(task.id)) {
-          runCatching { finishBeforeAlertDelivery(WaitEndReason.ALERT_DELIVERY_FAILED, clock()) }
-        } else if (runCatching { recordSubmissionReceipt() }.isSuccess || runCatching { markAlertSubmitted() }.getOrDefault(false)) {
-          submission.compareAndSet(Submission.WITHDRAWN, Submission.SUBMITTED)
-        }
-        return@withContext null
-      }
-      // 从系统接受提交起观察撤权，不等收据或 Room 标记；检测到关闭会永久封口。
-      observeOutputAvailability()
-      if (runCatching { recordSubmissionReceipt() }.isSuccess) {
-        submission.compareAndSet(Submission.POSTED, Submission.SUBMITTED)
-        return@withContext true
-      }
-      // 先撤同任务通知，再删 pending；撤回失败时仍尝试 Room 恢复凭据，绝不播放。
-      if (!(submission.compareAndSet(Submission.POSTED, Submission.WITHDRAWN) ||
-          submission.compareAndSet(Submission.CLOSED, Submission.WITHDRAWN))) return@withContext null
-      if (platform.withdrawAlert(task.id)) {
-        runCatching { finishBeforeAlertDelivery(WaitEndReason.ALERT_DELIVERY_FAILED, clock()) }
-        return@withContext null
-      }
-      if (!runCatching { markAlertSubmitted() }.getOrDefault(false)) return@withContext null
-      submission.compareAndSet(Submission.WITHDRAWN, Submission.SUBMITTED)
-      false
     }
     if (!alive()) return true
     if (receiptSaved == null || remaining() <= 0) {
@@ -322,8 +289,9 @@ class WaitSession(
       false
     }
     if (!saved) {
-      // 通知已引用该快照，停止输出但保留查看与确认入口。
-      finish(WaitEndReason.ALERTED, announce = false)
+      // 收据已写入但 Room 标记失败：保留触发快照，停止输出并提示可能中断。
+      outputInterrupted = true
+      finish(WaitEndReason.ALERT_OUTPUT_INTERRUPTED, announce = false)
       return true
     }
     val accepted = handoff.withLock {
@@ -369,6 +337,43 @@ class WaitSession(
     return true
   }
 
+  private suspend fun submitPendingAlert(snapshot: AlertSnapshot, remaining: () -> Long): Boolean? {
+    // 只有替换等待这个交接；系统提交阻塞时仍可主动停止或到限。
+    if (remaining() <= 0 || !platform.notificationsAllowed() || !submission.compareAndSet(Submission.PENDING, Submission.POSTING)) return null
+    if (!runCatching { platform.submitAlert(snapshot, remaining) }.getOrDefault(false)) {
+      if (!submission.compareAndSet(Submission.POSTING, Submission.PENDING) &&
+        submission.compareAndSet(Submission.CLOSED, Submission.WITHDRAWN)) {
+        runCatching { finishBeforeAlertDelivery(WaitEndReason.ALERT_DELIVERY_FAILED, clock()) }
+      }
+      return null
+    }
+    if (remaining() <= 0 || !submission.compareAndSet(Submission.POSTING, Submission.POSTED)) {
+      val mayWithdraw = submission.compareAndSet(Submission.POSTING, Submission.WITHDRAWN) ||
+        submission.compareAndSet(Submission.CLOSED, Submission.WITHDRAWN)
+      if (!mayWithdraw) return null
+      if (platform.withdrawAlert(task.id)) {
+        runCatching { finishBeforeAlertDelivery(WaitEndReason.ALERT_DELIVERY_FAILED, clock()) }
+      } else if (runCatching { recordSubmissionReceipt() }.isSuccess || runCatching { markAlertSubmitted() }.getOrDefault(false)) {
+        submission.compareAndSet(Submission.WITHDRAWN, Submission.SUBMITTED)
+      }
+      return null
+    }
+    observeOutputAvailability()
+    // 收据落盘失败时，先撤回系统通知；成功撤回即清理未提交快照，失败则保留提交不确定事实。
+    if (runCatching { recordSubmissionReceipt() }.isSuccess) {
+      submission.compareAndSet(Submission.POSTED, Submission.SUBMITTED)
+      return true
+    }
+    if (!submission.compareAndSet(Submission.POSTED, Submission.WITHDRAWN)) return null
+    if (platform.withdrawAlert(task.id)) {
+      runCatching { finishBeforeAlertDelivery(WaitEndReason.ALERT_DELIVERY_FAILED, clock()) }
+      return null
+    }
+    if (!runCatching { markAlertSubmitted() }.getOrDefault(false)) return null
+    submission.compareAndSet(Submission.WITHDRAWN, Submission.SUBMITTED)
+    return false
+  }
+
   private suspend fun observeOutputAvailability() = handoff.withLock {
     if (!alive()) return@withLock
     outputAvailabilityJob = scope.launch(Dispatchers.IO) {
@@ -410,8 +415,9 @@ class WaitSession(
       }
       if (!identity.compareAndSet(task.id, Long.MIN_VALUE)) return@withLock false
       if (pending != null) acceptDelivery(pending, submissionPending = true)
+      // 确认路径不等待 Room；输出和前台服务先停，确认落库由应用层继续处理。
       endOutputCarrier()
-      completeAlert(WaitEndReason.ALERTED)
+      completeAlert(WaitEndReason.ALERT_CONFIRMED)
       true
     }
   }
@@ -500,33 +506,41 @@ class WaitSession(
       if (pendingOnly && pendingSnapshot == null) return@withLock
       if (!identity.compareAndSet(task.id, Long.MIN_VALUE)) return@withLock
       val delivery = submission.getAndSet(Submission.CLOSED)
-      val completedSubmission = delivery == Submission.SUBMITTED
+      val completedSubmission = delivery == Submission.POSTED || delivery == Submission.SUBMITTED
       val pending = pendingSnapshot
-      val endReason = if (completedSubmission && reason == WaitEndReason.ALERT_DELIVERY_FAILED) WaitEndReason.ALERTED else reason
       if (completedSubmission && pending != null) acceptDelivery(pending, submissionPending = true)
+      val endReason = when {
+        reason == WaitEndReason.CANCELLED && alert != null -> if (confirmed) WaitEndReason.ALERT_CONFIRMED else WaitEndReason.ALERTED
+        reason == WaitEndReason.CANCELLED && delivery == Submission.POSTING -> WaitEndReason.CANCELLED_DURING_DELIVERY
+        completedSubmission && outputInterrupted -> WaitEndReason.ALERT_OUTPUT_INTERRUPTED
+        completedSubmission && reason == WaitEndReason.ALERT_DELIVERY_FAILED -> WaitEndReason.ALERTED
+        else -> reason
+      }
       val endedAt = clock()
-      var cleanupFailed = false
       endOutputCarrier()
       job?.cancel()
       job = null
       platform.stopForegroundService(task.id)
-      try {
-        if (pending != null && delivery == Submission.PENDING) finishBeforeAlertDelivery(endReason, endedAt)
-      } catch (_: Exception) {
-        cleanupFailed = true
-      } finally {
-        pendingSnapshot = null
-        state = state.copy(
-          running = false,
-          endedReason = endReason,
-          endedAt = endedAt,
-          nextAttemptAt = null,
-          message = if (cleanupFailed) "${endReason.message} 本机结束状态未能保存。"
-            else if (alert != null && !confirmed && endReason == WaitEndReason.CANCELLED) WaitEndReason.ALERTED.message
-            else endReason.message,
-          alerts = state.alerts.map { it.copy(outputEnded = true) },
-        )
-        onState(state)
+      pendingSnapshot = null
+      state = state.copy(
+        running = false,
+        endedReason = endReason,
+        endedAt = endedAt,
+        nextAttemptAt = null,
+        message = endReason.message,
+        alerts = state.alerts.map { it.copy(outputEnded = true) },
+      )
+      onState(state)
+      if (pending != null && delivery == Submission.PENDING) {
+        // 停止动作不能被等待 Room 写锁的清理拖住。
+        scope.launch(Dispatchers.IO) {
+          if (runCatching { finishBeforeAlertDelivery(endReason, endedAt) }.isFailure) {
+            handoff.withLock {
+              state = state.copy(message = "${endReason.message} 本机结束状态未能保存。")
+              onState(state)
+            }
+          }
+        }
       }
       if (announce && alert == null && platform.notificationsAllowed()) platform.announceEnd(reason)
     }

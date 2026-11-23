@@ -33,7 +33,7 @@ class WaitService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     val owner = intent?.getLongExtra(EXTRA_WAIT_TASK, Long.MIN_VALUE)?.takeIf { it != Long.MIN_VALUE }
-    val obsolete = owner != null && !WaitRuntime.acceptsStart(owner)
+    val obsolete = owner == null || !WaitRuntime.acceptsStart(owner)
     val previous = this.owner
     if (obsolete && previous?.taskId != null) {
       // 忽略身份，保留系统最新 startId，否则当前轮随后无法 stopSelfResult。
@@ -48,9 +48,14 @@ class WaitService : Service() {
         start = { startForeground(WaitNotifications.NOTIFICATION_ID, it, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) },
       )
       WaitRuntime.service = this
-      if (obsolete || (owner != null && !WaitRuntime.acceptsStart(owner))) {
-        // 已取消的排队请求也必须先完成前台握手；握手期间的取消同样不能漏掉。
-        stopOwned(requireNotNull(owner))
+      if (obsolete || owner == null || !WaitRuntime.acceptsStart(owner)) {
+        // 无本轮启动授权的 Intent 只完成 Android 要求的前台握手，不能留下服务。
+        if (owner != null) stopOwned(owner)
+        else if (stopSelfResult(startId)) {
+          this.owner = null
+          if (WaitRuntime.service === this) WaitRuntime.service = null
+          stopForeground(STOP_FOREGROUND_REMOVE)
+        }
       }
     } catch (error: Exception) {
       handoff(succeeded = false) { finishTask(it) }
@@ -141,6 +146,11 @@ internal object WaitRuntime {
 
   private var promotingTask: Long? = null
 
+  @Synchronized fun outputReleased(): Boolean {
+    val task = requestedTask
+    return promotingTask == null && (task == null || (stoppedRequest && service?.owns(task) != true))
+  }
+
   @Synchronized fun requestStart(taskId: Long): Boolean {
     // shortcut: Android 无法取消已发出的 Binder；返回前拒绝新一轮，避免迟到调用覆盖它。
     if (promotingTask != null) return false
@@ -159,7 +169,7 @@ internal object WaitRuntime {
     if (promotingTask == owner) promotingTask = null
   }
 
-  fun acceptsStart(taskId: Long): Boolean = requestedTask == null || (requestedTask == taskId && !stoppedRequest)
+  fun acceptsStart(taskId: Long): Boolean = requestedTask == taskId && !stoppedRequest
 
   fun stopService(taskId: Long) {
     val current = synchronized(this) {

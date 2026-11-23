@@ -33,7 +33,13 @@ class WatchItemApplication(
   private val mutableState = MutableStateFlow(WatchItemsState())
   val state = mutableState.asStateFlow()
   private val revision = java.util.concurrent.atomic.AtomicLong(0)
-  private var session: WaitSession? = null
+  @Volatile private var session: WaitSession? = null
+  private val taskChanges = kotlinx.coroutines.sync.Mutex()
+  private val notificationHandoff = kotlinx.coroutines.sync.Mutex()
+
+  private fun activeTask(stopCode: String? = null): Long? = session?.current()?.takeIf {
+    it.running && (stopCode == null || it.stopCode == stopCode)
+  }?.taskId
   private val taskIds = java.util.concurrent.atomic.AtomicLong(clock())
   private val settingsLock = kotlinx.coroutines.sync.Mutex()
 
@@ -58,46 +64,73 @@ class WatchItemApplication(
       }
     }
     try {
-      val openingItems = state.value.items
-      val liveTaskId = session?.current()?.takeIf { it.running }?.taskId
-      val (items, last, savedAlerts) = withContext(Dispatchers.IO) {
-        val items = store.all()
-        val last = tasks.load()
-        val posted = platform.postedAlertIds() - setOfNotNull(liveTaskId)
-        val saved = if (posted.isEmpty()) tasks.alerts() else tasks.alertsWithPosted(posted)
-        Triple(items, last, saved)
-      }
-      taskIds.accumulateAndGet(maxOf(last?.id ?: 0L, savedAlerts.maxOfOrNull { it.snapshot.taskId } ?: 0L), { id, saved -> maxOf(id, saved) })
-      mutableState.update { current ->
-        val wait = if (liveTaskId != null || session != null || last == null) current.wait else {
-          // 重开只展示已保存的结果，不恢复监测或补发提醒。
-          val reason = when {
-            last.endedReason != null && last.endedReason != WaitEndReason.ALERTED && last.endedReason != WaitEndReason.ALERT_CONFIRMED -> last.endedReason
-            last.alertConfirmed || savedAlerts.any { it.snapshot.taskId == last.id && it.confirmed } -> WaitEndReason.ALERT_CONFIRMED
-            last.alert != null || savedAlerts.any { it.snapshot.taskId == last.id } -> WaitEndReason.ALERTED
-            last.endedReason != null -> last.endedReason
-            clock() >= last.deadlineAt -> WaitEndReason.MAX_DURATION
-            clock() >= (last.lastSuccessAt ?: last.startedAt).plusDelay(MAX_SILENCE) -> WaitEndReason.NO_SUCCESS
-            else -> WaitEndReason.INTERRUPTED
-          }
-          WaitState(taskId = last.id, stopCode = last.stopCode, stationName = last.stationName, endedReason = reason, message = reason.message)
-        }
-        val liveId = session?.current()?.takeIf { it.running }?.taskId
-        val restored = savedAlerts.filterNot { it.snapshot.taskId == liveTaskId || it.snapshot.taskId == liveId }
-        val known = mergeAlerts(restored, current.wait.alerts).map { alert ->
-          if (savedAlerts.any { it.snapshot.taskId == alert.snapshot.taskId && it.confirmed }) {
-            alert.copy(confirmed = true, outputEnded = true)
-          } else alert
-        }
-        current.copy(items = if (current.saving || current.items !== openingItems) current.items else items, wait = wait.copy(alerts = known))
-      }
-      if (liveTaskId == null && session == null && last != null) {
-        if (last.endedReason != null) withContext(Dispatchers.IO) { tasks.clear(last.id) }
-        else platform.dismiss()
-      }
+      restoreLocalState()
     } catch (error: Exception) {
       if (error is CancellationException) throw error
       mutableState.update { it.copy(message = "本机关注项读取失败，请重试；不会清除数据") }
+    }
+  }
+
+  private suspend fun restoreLocalState() {
+    val openingItems = state.value.items
+    val liveTaskId = session?.current()?.takeIf { it.running }?.taskId
+    val openingWait = state.value.wait
+    val (items, last, savedAlerts) = withContext(Dispatchers.IO) {
+      val items = store.all()
+      val last = if (liveTaskId == null) tasks.load() ?: tasks.latestResult() else tasks.latestResult()
+      val posted = platform.postedAlertIds() - setOfNotNull(liveTaskId)
+      val saved = if (posted.isEmpty()) tasks.alerts() else tasks.alertsWithPosted(posted)
+      Triple(items, last, saved)
+    }
+    val reason = last?.let { task ->
+      val snapshot = savedAlerts.firstOrNull { it.snapshot.taskId == task.id }
+      when {
+        task.endedReason != null && task.endedReason !in setOf(
+          WaitEndReason.CANCELLED, WaitEndReason.CANCELLED_DURING_DELIVERY, WaitEndReason.ALERT_DELIVERY_FAILED,
+          WaitEndReason.ALERTED, WaitEndReason.ALERT_CONFIRMED,
+        ) -> task.endedReason
+        task.alertConfirmed || snapshot?.confirmed == true -> WaitEndReason.ALERT_CONFIRMED
+        task.alert != null || snapshot != null -> WaitEndReason.ALERTED
+        task.endedReason != null -> task.endedReason
+        clock() >= task.deadlineAt -> WaitEndReason.MAX_DURATION
+        clock() >= (task.lastSuccessAt ?: task.startedAt).plusDelay(MAX_SILENCE) -> WaitEndReason.NO_SUCCESS
+        else -> WaitEndReason.INTERRUPTED
+      }
+    }
+    if (liveTaskId == null && last != null && reason != null && last.endedReason == null) {
+      taskChanges.withLock {
+        // 读取本机记录期间另一轮可能已启动，重开只能收尾它读取到的旧任务。
+        if (session == null && state.value.wait === openingWait) withContext(Dispatchers.IO) {
+          if (tasks.load()?.id == last.id) {
+            platform.dismiss()
+            if (last.id !in platform.postedAlertIds()) tasks.discardPendingAlert(last.id)
+            tasks.finish(last.id, reason, clock())
+          }
+        }
+      }
+    }
+    taskIds.accumulateAndGet(maxOf(last?.id ?: 0L, savedAlerts.maxOfOrNull { it.snapshot.taskId } ?: 0L), { id, saved -> maxOf(id, saved) })
+    mutableState.update { current ->
+      val result = if (last != null && reason != null) WaitResult(last.id, last.stationName, reason) else null
+      val wait = if (liveTaskId != null || session != null || current.wait !== openingWait || last == null || reason == null) current.wait else {
+        WaitState(taskId = last.id, stopCode = last.stopCode, stationName = last.stationName,
+          endedReason = reason, endedAt = last.endedAt, message = reason.message)
+      }
+      val liveId = session?.current()?.takeIf { it.running }?.taskId
+      val restored = savedAlerts.filterNot { it.snapshot.taskId == liveTaskId || it.snapshot.taskId == liveId }
+      val known = mergeAlerts(restored, current.wait.alerts).map { alert ->
+        val existing = current.wait.alerts.firstOrNull { it.snapshot.taskId == alert.snapshot.taskId }
+        if (existing?.confirmed == true || savedAlerts.any { it.snapshot.taskId == alert.snapshot.taskId && it.confirmed }) {
+          alert.copy(confirmed = true, outputEnded = true)
+        } else if (existing?.confirmationError == true) {
+          alert.copy(confirmationError = true)
+        } else alert
+      }
+      current.copy(
+        items = if (current.saving || current.items !== openingItems) current.items else items,
+        wait = wait.copy(alerts = known),
+        latestResult = result?.takeIf { it.taskId >= (current.latestResult?.taskId ?: Long.MIN_VALUE) } ?: current.latestResult,
+      )
     }
   }
 
@@ -108,19 +141,26 @@ class WatchItemApplication(
   }
 
   /** 编辑已有关注项：站台固定不换绑，只改选线路；离线也先展示本机记录。 */
-  suspend fun edit(stopCode: String) {
-    if (state.value.saving) return
-    val item = runCatching { withContext(Dispatchers.IO) { store.find(stopCode) } }.getOrNull() ?: return
-    val station = StationChoice(item.stationName, item.stopCode, listOf(StationStop(item.stopCode, item.stationName)), item.lastCheckedAt ?: 0)
-    val token = revision.incrementAndGet()
-    mutableState.update {
-      it.copy(
-        adding = true, currentPage = false, loading = true, message = null, codes = emptyList(), deleting = null,
-        confirmation = WatchItemImportSession(station, item.stopCode, emptyList(), emptySet(), item, editing = true, records = item.selectedLines),
-      )
+  suspend fun edit(stopCode: String) = edit(stopCode, null)
+
+  private suspend fun edit(stopCode: String, approval: WaitChange?) {
+    val setup = taskChanges.withLock {
+      val item = readWatchItem(stopCode) ?: return
+      if (!allowItemChange(stopCode, WaitChangeAction.EDIT, approval)) return
+      val station = StationChoice(item.stationName, item.stopCode, listOf(StationStop(item.stopCode, item.stationName)), item.lastCheckedAt ?: 0)
+      val token = revision.incrementAndGet()
+      mutableState.update {
+        it.copy(
+          adding = true, currentPage = false, loading = true, message = null, codes = emptyList(), deleting = null,
+          waitChange = null, preflight = null,
+          confirmation = WatchItemImportSession(station, item.stopCode, emptyList(), emptySet(), item, editing = true, records = item.selectedLines),
+        )
+      }
+      station to token
     }
+    val (station, token) = setup
     try {
-      loadStop(station, item.stopCode, token, restoreOriginal = true)
+      loadStop(station, stopCode, token, restoreOriginal = true)
     } catch (error: Exception) {
       handleFailure(token, error)
     } finally {
@@ -187,25 +227,21 @@ class WatchItemApplication(
   /** 从关注项打开开始核对；W/B 已保存过的沿用，不在此处自动估算。 */
   fun prepareWait(stopCode: String) {
     val item = state.value.items.firstOrNull { it.stopCode == stopCode } ?: return
-    // 运行中的任务不被静默覆盖：明确提示，交由用户先结束当前这轮。
-    if (state.value.wait.running) {
-      mutableState.update { it.copy(currentPage = true, preflight = null, message = "已有一轮等车在运行，先结束它再开始。") }
-      return
-    }
-    mutableState.update {
-      it.copy(
+    mutableState.update { state ->
+      if (state.saving || state.preflight?.starting == true || state.waitChange != null || state.deleting != null) return@update state
+      val sameWait = state.wait.running && state.wait.stopCode == stopCode
+      state.copy(
         currentPage = true,
         adding = false,
         confirmation = null,
-        wait = WaitState(stopCode = item.stopCode, stationName = item.stationName, walkMinutes = item.walkMinutes, bufferMinutes = item.bufferMinutes, alerts = it.wait.alerts),
-        preflight = WaitPreflight(
+        preflight = if (sameWait) null else WaitPreflight(
           stopCode = item.stopCode,
           stationName = item.stationName,
           lines = item.selectedLines,
           walkText = item.walkMinutes?.let { value -> formatMinutes(value) } ?: "",
           bufferText = formatMinutes(item.bufferMinutes),
         ),
-        message = null,
+        message = if (sameWait) "已有一轮等车在运行" else null,
       )
     }
   }
@@ -223,13 +259,31 @@ class WatchItemApplication(
   }
 
   fun dismissPreflight() {
-    if (state.value.preflight?.starting == true || state.value.wait.running) return
-    mutableState.update { it.copy(preflight = null) }
+    mutableState.update {
+      if (it.preflight?.starting == true || it.waitChangeCommitting) it
+      else it.copy(preflight = null, waitChange = it.waitChange?.takeUnless { change -> change.action == WaitChangeAction.REPLACE })
+    }
   }
 
-  fun notificationPermissionDenied() {
+  /** 等平台授权期间 Activity 可以重建；结果只归发起时的草稿。 */
+  internal fun beginNotificationPermission(draft: WaitPreflight): Boolean {
+    val current = state.value
+    if (current.preflight !== draft || current.notificationPermissionDraft != null) return false
+    return mutableState.compareAndSet(current, current.copy(notificationPermissionDraft = draft))
+  }
+
+  internal fun takeNotificationPermissionDraft(): WaitPreflight? {
+    while (true) {
+      val current = state.value
+      val draft = current.notificationPermissionDraft ?: return null
+      if (mutableState.compareAndSet(current, current.copy(notificationPermissionDraft = null))) return draft
+    }
+  }
+
+  fun notificationPermissionDenied(expected: WaitPreflight? = state.value.preflight) {
     mutableState.update { state ->
-      state.copy(preflight = state.preflight?.copy(notificationBlocked = true, error = "通知未获授权，未开始监测。请在系统设置允许通知后重试。"))
+      if (expected == null || state.preflight !== expected) state
+      else state.copy(preflight = expected.copy(notificationBlocked = true, error = "通知未获授权，未开始监测。请在系统设置允许通知后重试。"))
     }
   }
 
@@ -273,7 +327,9 @@ class WatchItemApplication(
   }
 
   /** 由可见页面手动开始一次有限等车；任一前置条件不满足都不假启动。 */
-  suspend fun startWait() { startWait(state.value.preflight ?: return) }
+  suspend fun startWait(expected: WaitPreflight? = state.value.preflight) {
+    if (expected != null) startWait(expected, false)
+  }
 
   /** 重查只更新当前核对页，不代表用户同意开始监测。 */
   suspend fun recheckChineseVoice() {
@@ -298,7 +354,7 @@ class WatchItemApplication(
 
   suspend fun previewReminder() {
     val current = state.value
-    val draft = current.preflight?.takeUnless { it.starting || it.verifying || it.checkingVoice } ?: return
+    val draft = current.preflight?.takeUnless { current.wait.running || it.starting || it.verifying || it.checkingVoice } ?: return
     val message = try {
       val includeVoice = current.voiceEnabled && !draft.voiceUnavailable
       val result = platform.previewReminder(includeVoice)
@@ -322,13 +378,10 @@ class WatchItemApplication(
     startWait(draft, withoutVoice = true)
   }
 
-  private suspend fun startWait(draft: WaitPreflight, withoutVoice: Boolean = false) {
+  private suspend fun startWait(draft: WaitPreflight, withoutVoice: Boolean = false, replacement: WaitChange? = null) {
     val current = state.value
-    if (current.preflight !== draft || draft.starting || draft.verifying || draft.checkingVoice) return
-    if (current.wait.running) {
-      mutableState.update { it.copy(preflight = draft.copy(error = "已有一轮等车在运行，先结束它再开始。")) }
-      return
-    }
+    if (current.preflight !== draft || draft.starting || draft.verifying || draft.checkingVoice ||
+      current.waitChange !== replacement || current.saving) return
     val walk = draft.walkMinutes
     val buffer = draft.bufferMinutes
     if (walk == null) {
@@ -351,11 +404,29 @@ class WatchItemApplication(
       // 降级确认可能停留很久；继续走同一来源的共享请求门控。
       val verified = verifyWait(draft) ?: return
       // 核对成功仅能继续同一份草稿，不能把随后打开的站台自动启动。
-      return startWait(verified, withoutVoice)
+      return startWait(verified, withoutVoice, replacement)
     }
     val starting = draft.copy(starting = true, notificationBlocked = false, voiceUnavailable = false, error = null)
     if (!mutableState.compareAndSet(current, current.copy(preflight = starting))) return
-    val voiceEnabled = current.voiceEnabled && !withoutVoice
+    try {
+      continueStart(draft, starting, walk, buffer, current.voiceEnabled && !withoutVoice, withoutVoice, replacement)
+    } finally {
+      mutableState.update { state ->
+        if (state.waitChange !== replacement) state
+        else state.copy(waitChange = null, preflight = if (state.preflight === starting) draft else state.preflight)
+      }
+    }
+  }
+
+  private suspend fun continueStart(
+    draft: WaitPreflight,
+    starting: WaitPreflight,
+    walk: Double,
+    buffer: Double,
+    voiceEnabled: Boolean,
+    withoutVoice: Boolean,
+    replacement: WaitChange?,
+  ) {
     try {
       if (voiceEnabled && !platform.chineseVoiceAvailable()) {
         mutableState.update { if (it.preflight === starting) it.copy(preflight = draft.copy(voiceUnavailable = true, error = null)) else it }
@@ -371,87 +442,206 @@ class WatchItemApplication(
         error = "通知已关闭，未开始监测。")) else it }
       return
     }
-    // W/B 保存到关注项；保存失败不假启动。
-    try {
-      val item = withContext(Dispatchers.IO) { store.find(draft.stopCode) }
-      if (item != null && (item.walkMinutes != walk || item.bufferMinutes != buffer)) {
-        withContext(Dispatchers.IO) { store.save(item.copy(walkMinutes = walk, bufferMinutes = buffer)) }
-        val refreshed = withContext(Dispatchers.IO) { store.all() }
-        mutableState.update { it.copy(items = refreshed) }
+    taskChanges.withLock {
+      val current = state.value
+      if (current.preflight !== starting || current.waitChange !== replacement || current.deleting != null) return
+      if (!isVerificationFresh(draft.verifiedAt)) {
+        mutableState.update { it.copy(preflight = draft.copy(verifiedAt = null, error = "线路核对结果已过期，请重试。")) }
+        return
       }
-    } catch (error: Exception) {
-      if (error is CancellationException) throw error
-      mutableState.update { it.copy(preflight = draft.copy(starting = false, error = "本机保存失败，未开始监测：${error.message ?: "请重试"}")) }
-      return
-    }
-    if (state.value.preflight !== starting) return
-    if (!isVerificationFresh(draft.verifiedAt)) {
-      mutableState.update { if (it.preflight === starting) it.copy(preflight = draft.copy(verifiedAt = null,
-        error = "线路核对结果已过期，请重试。")) else it }
-      return
-    }
-    val now = clock()
-    val task = WaitTask(
-      id = taskIds.incrementAndGet(),
-      stopCode = draft.stopCode,
-      stationName = draft.stationName,
-      startedAt = now,
-      deadlineAt = now.plusDelay(MAX_WAIT),
-      lastSuccessAt = null,
-      walkMinutes = walk,
-      bufferMinutes = buffer,
-      linesJson = Json.encodeToString(draft.lines),
-    )
-    // 服务回调按身份收尾；在服务启动之前先落盘，再安装它要控制的会话。
-    try {
-      withContext(Dispatchers.IO) { tasks.save(task) }
-    } catch (error: Exception) {
-      if (error is CancellationException) throw error
-      mutableState.update { it.copy(preflight = draft.copy(starting = false, error = "本机任务状态保存失败，未开始监测")) }
-      return
-    }
-    val running = WaitSession(
-      source = source,
-      platform = platform,
-      task = task,
-      clock = clock,
-      sleeper = sleeper,
-      elapsedClock = elapsedClock,
-      submissionSleeper = submissionSleeper,
-      requestDeadlineSleeper = requestDeadlineSleeper,
-      scope = scope,
-      onState = { next ->
-        mutableState.update { state ->
-          if (state.wait.taskId != task.id || (!state.wait.running && next.running)) state
-          else state.copy(wait = next.copy(alerts = mergeAlerts(state.wait.alerts, next.alerts)))
+      val currentId = activeTask()
+      if (replacement == null && currentId != null) {
+        mutableState.update { latest ->
+          if (latest.preflight !== starting || latest.deleting != null || latest.waitChange != null) latest
+          else latest.copy(preflight = draft,
+            waitChange = WaitChange(WaitChangeAction.REPLACE, draft.stopCode, currentId, draft, withoutVoice))
         }
-        scope.launch(Dispatchers.IO) {
-          runCatching {
-            if (next.running) tasks.progress(task.id, next.phase ?: WaitPhase.WAITING_FIRST, next.lastSuccessAt)
-            else tasks.finish(task.id, next.endedReason ?: WaitEndReason.INTERRUPTED, next.endedAt ?: clock())
+        return
+      }
+      if (currentId != null && currentId != replacement?.taskId) return
+      val candidate = try {
+        withContext(Dispatchers.IO) { store.find(draft.stopCode) }
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        mutableState.update { it.copy(preflight = draft.copy(error = "本机关注项读取失败，未开始监测。")) }
+        return
+      }
+      if (candidate == null || candidate.selectedLines != draft.lines) {
+        mutableState.update { it.copy(preflight = draft.copy(verifiedAt = null, error = "关注项已变化，请返回关注项重新开始。")) }
+        return
+      }
+      // W/B 保存到关注项；保存失败不结束旧任务。
+      try {
+        if (candidate.walkMinutes != walk || candidate.bufferMinutes != buffer) {
+          withContext(Dispatchers.IO) { store.save(candidate.copy(walkMinutes = walk, bufferMinutes = buffer)) }
+          val refreshed = withContext(Dispatchers.IO) { store.all() }
+          mutableState.update { it.copy(items = refreshed) }
+        }
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        mutableState.update { it.copy(preflight = draft.copy(starting = false, error = "本机保存失败，未开始监测：${error.message ?: "请重试"}")) }
+        return
+      }
+      if (state.value.preflight !== starting) return
+      if (!isVerificationFresh(draft.verifiedAt)) {
+        mutableState.update { if (it.preflight === starting) it.copy(preflight = draft.copy(verifiedAt = null,
+          error = "线路核对结果已过期，请重试。")) else it }
+        return
+      }
+      if (!stopForChange(currentId)) {
+        mutableState.update { it.copy(preflight = draft.copy(error = "上一轮等车的输出尚未停止，未开始新一轮。请稍后重试。")) }
+        return
+      }
+      if (!platform.notificationsAllowed() || !isVerificationFresh(draft.verifiedAt)) {
+        mutableState.update { it.copy(preflight = draft.copy(verifiedAt = null, error = "开始条件已变化，请重新核对。")) }
+        return
+      }
+      val endedBeforeStart = state.value.wait
+      val now = clock()
+      val task = WaitTask(
+        id = taskIds.incrementAndGet(),
+        stopCode = draft.stopCode,
+        stationName = draft.stationName,
+        startedAt = now,
+        deadlineAt = now.plusDelay(MAX_WAIT),
+        lastSuccessAt = null,
+        walkMinutes = walk,
+        bufferMinutes = buffer,
+        linesJson = Json.encodeToString(draft.lines),
+      )
+      // 服务回调按身份收尾；在服务启动之前先落盘，再安装它要控制的会话。
+      // 新任务未能启动时恢复上一轮的最少记录，而不是把两轮一起从磁盘删掉。
+      val previousTask = try {
+        withContext(Dispatchers.IO) {
+          val endedId = endedBeforeStart.taskId
+          val reason = endedBeforeStart.endedReason
+          if (endedId != null && reason != null) tasks.finish(endedId, reason, endedBeforeStart.endedAt ?: now)
+          tasks.load().also { tasks.save(task) }
+        }
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        mutableState.update { it.copy(preflight = draft.copy(starting = false, error = "本机任务状态保存失败，未开始监测")) }
+        return
+      }
+      val running = WaitSession(
+        source = source,
+        platform = platform,
+        task = task,
+        clock = clock,
+        sleeper = sleeper,
+        elapsedClock = elapsedClock,
+        submissionSleeper = submissionSleeper,
+        requestDeadlineSleeper = requestDeadlineSleeper,
+        scope = scope,
+        onState = { next ->
+          mutableState.update { state ->
+            if (state.wait.taskId != task.id || (!state.wait.running && next.running)) state
+            else state.copy(
+              wait = next.copy(alerts = mergeAlerts(state.wait.alerts, next.alerts)),
+              latestResult = next.endedReason?.let { WaitResult(task.id, task.stationName, it) } ?: state.latestResult,
+            )
           }
+          scope.launch(Dispatchers.IO) {
+            runCatching {
+              if (next.running) tasks.progress(task.id, next.phase ?: WaitPhase.WAITING_FIRST, next.lastSuccessAt)
+              else tasks.finish(task.id, next.endedReason ?: WaitEndReason.INTERRUPTED, next.endedAt ?: clock())
+            }
+          }
+        },
+        recordAlert = { snapshot -> withContext(Dispatchers.IO) { tasks.recordAlert(task.id, snapshot) } },
+        recordSubmissionReceipt = { tasks.recordSubmissionReceipt(task.id) },
+        markAlertSubmitted = { withContext(Dispatchers.IO) { tasks.markAlertSubmitted(task.id) } },
+        finishBeforeAlertDelivery = { reason, endedAt ->
+          withContext(Dispatchers.IO) { tasks.finishBeforeAlertDelivery(task.id, reason, endedAt) }
+        },
+        voiceEnabled = voiceEnabled,
+      )
+      session = running
+      mutableState.update { it.copy(wait = running.current().copy(alerts = it.wait.alerts)) }
+      if (!platform.startForegroundService(task.id)) {
+        session = null
+        mutableState.update {
+          it.copy(wait = endedBeforeStart.copy(alerts = it.wait.alerts), preflight = draft.copy(starting = false, error = "前台服务启动失败，未开始监测"))
         }
-      },
-      recordAlert = { snapshot -> withContext(Dispatchers.IO) { tasks.recordAlert(task.id, snapshot) } },
-      recordSubmissionReceipt = { tasks.recordSubmissionReceipt(task.id) },
-      markAlertSubmitted = { withContext(Dispatchers.IO) { tasks.markAlertSubmitted(task.id) } },
-      finishBeforeAlertDelivery = { reason, endedAt ->
-        withContext(Dispatchers.IO) { tasks.finishBeforeAlertDelivery(task.id, reason, endedAt) }
-      },
-      voiceEnabled = voiceEnabled,
-    )
-    session = running
-    mutableState.update { it.copy(wait = running.current().copy(alerts = it.wait.alerts)) }
-    if (!platform.startForegroundService(task.id)) {
-      session = null
-      mutableState.update {
-        it.copy(wait = it.wait.copy(running = false, taskId = null), preflight = draft.copy(starting = false, error = "前台服务启动失败，未开始监测"))
+        try {
+          withContext(Dispatchers.IO) {
+            if (previousTask == null) tasks.clear(task.id)
+            else tasks.save(previousTask)
+          }
+        } catch (error: Exception) {
+          if (error is CancellationException) throw error
+          mutableState.update { it.copy(message = "前台服务未启动，上一轮结果未能恢复到本机记录。") }
+        }
+        return
       }
-      withContext(Dispatchers.IO) { tasks.clear(task.id) }
-      return
+      mutableState.update { it.copy(preflight = null, adding = false, confirmation = null, currentPage = true) }
+      if (session === running) running.start()
     }
-    mutableState.update { it.copy(preflight = null, adding = false, confirmation = null, currentPage = true) }
-    if (session === running) running.start()
+  }
+
+  fun cancelWaitChange(change: WaitChange) {
+    mutableState.update {
+      if (it.waitChange !== change || it.waitChangeCommitting || it.saving || it.preflight?.starting == true || it.preflight?.verifying == true) it
+      else it.copy(waitChange = null, preflight = if (change.action == WaitChangeAction.REPLACE) null else it.preflight)
+    }
+  }
+
+  suspend fun confirmWaitChange(change: WaitChange) {
+    while (true) {
+      val current = state.value
+      if (current.waitChange !== change || current.waitChangeCommitting || current.saving ||
+        current.preflight?.starting == true || current.preflight?.verifying == true) return
+      if (mutableState.compareAndSet(current, current.copy(waitChangeCommitting = true))) break
+    }
+    try {
+      when (change.action) {
+        WaitChangeAction.REPLACE -> state.value.preflight?.takeIf { it === change.draft }?.let {
+          startWait(it, change.withoutVoice, change)
+        }
+        WaitChangeAction.EDIT -> edit(change.stopCode, change)
+        WaitChangeAction.SAVE -> save(change)
+        WaitChangeAction.REMOVE_RECORD -> removeStoredRecord(change.stopCode, requireNotNull(change.lineIdentity), change)
+      }
+    } finally {
+      mutableState.update {
+        it.copy(waitChange = it.waitChange?.takeUnless { pending -> pending === change }, waitChangeCommitting = false)
+      }
+    }
+  }
+
+  private suspend fun readWatchItem(stopCode: String): WatchItemEntity? = try {
+    withContext(Dispatchers.IO) { store.find(stopCode) }
+  } catch (error: Exception) {
+    if (error is CancellationException) throw error
+    mutableState.update { it.copy(message = "读取关注项失败，请重试。") }
+    null
+  }
+
+  /** 在写入锁中重新匹配任务 ID；旧确认不是停止新任务的授权。 */
+  private suspend fun allowItemChange(stopCode: String, action: WaitChangeAction, approval: WaitChange?,
+    draft: WatchItemImportSession? = null, lineIdentity: String? = null): Boolean {
+    val current = state.value
+    if (current.saving || current.deleting != null || current.waitChange !== approval || (draft != null && current.confirmation !== draft)) return false
+    val id = activeTask(stopCode)
+    if (approval == null && id != null) {
+      mutableState.update { it.copy(waitChange = WaitChange(action, stopCode, id, draft, lineIdentity = lineIdentity)) }
+      return false
+    }
+    if (approval != null && (approval.draft !== draft || (id != null && id != approval.taskId))) return false
+    if (approval != null && id == null && approval.taskId != 0L) return false
+    if (id != null && !stopForChange(id)) {
+      mutableState.update { it.copy(message = "上一轮的输出尚未停止，关注项未修改。") }
+      return false
+    }
+    return approval == null || state.value.waitChange === approval
+  }
+
+  private suspend fun stopForChange(taskId: Long?): Boolean {
+    if (taskId != null) stopWait(taskId)
+    return kotlinx.coroutines.withTimeoutOrNull(1_000) {
+      notificationHandoff.withLock { }
+      platform.awaitPreviousOutput()
+    } ?: false
   }
 
   /** 主动结束：立即停取数，退出前台服务，不发异常提示。 */
@@ -490,13 +680,23 @@ class WatchItemApplication(
         val stillPosted = taskId in platform.postedAlertIds()
         val hasEvidence = posted || stillPosted
         val saved = runCatching {
-          if (hasEvidence) tasks.confirmPostedAlert(taskId) else tasks.confirmAlert(taskId)
+          if (hasEvidence) {
+            tasks.confirmPostedAlert(taskId)
+          } else tasks.confirmAlert(taskId)
         }
-        // 冷启动时系统通知可能是 pending 的唯一提交证据，确认落库前不能撤掉。
-        if (saved.getOrDefault(false)) platform.clearAlert(taskId)
-        // 划除已移走原通知；只有可信通知动作才能替不存在的槽位留下收据。
-        else if (saved.isFailure && fromNotification && !stillPosted) runCatching { tasks.recordSubmissionReceipt(taskId) }
-        saved.getOrThrow()
+        val confirmedByStore = saved.getOrDefault(false)
+        if (!confirmedByStore && hasEvidence && !fromNotification) {
+          val fallback = runCatching {
+            tasks.markAlertSubmitted(taskId)
+            tasks.confirmAlert(taskId)
+          }
+          if (fallback.getOrDefault(false)) platform.clearAlert(taskId)
+          fallback.getOrThrow()
+        } else {
+          if (confirmedByStore) platform.clearAlert(taskId)
+          else if (saved.isFailure && fromNotification && !stillPosted) runCatching { tasks.recordSubmissionReceipt(taskId) }
+          saved.getOrThrow()
+        }
       }
     } catch (error: Exception) {
       if (error is CancellationException) throw error
@@ -509,7 +709,10 @@ class WatchItemApplication(
           it.copy(confirmed = confirmed, outputEnded = true, confirmationError = !confirmed)
         } else it
       }
-      state.copy(wait = if (confirmed && wait.taskId == taskId && !wait.running && wait.endedReason == WaitEndReason.ALERTED) {
+      val latest = state.latestResult?.let {
+        if (confirmed && it.taskId == taskId) it.copy(reason = WaitEndReason.ALERT_CONFIRMED) else it
+      }
+      state.copy(latestResult = latest, wait = if (confirmed && wait.taskId == taskId && !wait.running && wait.endedReason == WaitEndReason.ALERTED) {
         wait.copy(alerts = alerts, endedReason = WaitEndReason.ALERT_CONFIRMED, message = WaitEndReason.ALERT_CONFIRMED.message)
       } else wait.copy(alerts = alerts))
     }
@@ -657,88 +860,106 @@ class WatchItemApplication(
       mutableState.update { state -> state.copy(confirmation = state.confirmation?.let { it.copy(records = remaining, selected = nextSelected) }, message = null) }
       return
     }
-    val keep = original.selectedLines.filterNot { it.identity == identity }
-    val item = original.copy(selectedLinesJson = Json.encodeToString(keep))
-    try {
-      withContext(Dispatchers.IO) { store.save(item) }
-      mutableState.update { state ->
-        state.copy(
-          items = state.items.map { existing -> if (existing.stopCode == item.stopCode) item else existing },
-          confirmation = state.confirmation?.takeIf { it.stopCode == item.stopCode }?.copy(original = item, records = remaining, selected = nextSelected),
-          message = if (keep.isEmpty()) "过时记录已删除；关注项仍保留，可稍后重新选择线路" else "记录已删除，关注项仍保留",
-        )
-      }
-    } catch (error: Exception) {
-      if (error is CancellationException) throw error
-      mutableState.update { it.copy(message = "删除失败，记录仍保留，请重试") }
-    }
+    removeStoredRecord(original.stopCode, identity)
   }
 
   /** 列表里直接删除某条记录（通常是过时记录）；不需要联网，也不改变站台绑定。 */
-  suspend fun removeStoredRecord(stopCode: String, identity: String) {
-    if (state.value.saving) return
-    val item = state.value.items.firstOrNull { it.stopCode == stopCode }
-      ?: runCatching { withContext(Dispatchers.IO) { store.find(stopCode) } }.getOrNull() ?: return
-    val keep = item.selectedLines.filterNot { it.identity == identity }
-    if (keep.size == item.selectedLines.size) return
-    val updated = item.copy(
-      selectedLinesJson = Json.encodeToString(keep),
-      endStationName = keep.firstOrNull()?.endStationName ?: item.endStationName,
-      lineNo = keep.firstOrNull()?.lineNo ?: item.lineNo,
-      upDown = keep.firstOrNull()?.upDown ?: item.upDown,
-      targetSequence = keep.firstOrNull()?.targetSequence ?: item.targetSequence,
-    )
-    try {
-      withContext(Dispatchers.IO) { store.save(updated) }
-      mutableState.update { state ->
-        state.copy(
-          items = state.items.map { existing -> if (existing.stopCode == stopCode) updated else existing },
-          confirmation = state.confirmation?.takeIf { it.stopCode == stopCode }?.let { draft ->
-            draft.copy(original = updated, records = draft.records.filterNot { it.identity == identity }, selected = draft.selected - identity)
-          },
-          message = if (keep.isEmpty()) "过时记录已删除；关注项仍保留，可稍后重新选择线路" else "记录已删除，关注项仍保留",
-        )
+  suspend fun removeStoredRecord(stopCode: String, identity: String) = removeStoredRecord(stopCode, identity, null)
+
+  private suspend fun removeStoredRecord(stopCode: String, identity: String, approval: WaitChange?) {
+    taskChanges.withLock {
+      val item = readWatchItem(stopCode) ?: return
+      val keep = item.selectedLines.filterNot { it.identity == identity }
+      if (keep.size == item.selectedLines.size ||
+        !allowItemChange(stopCode, WaitChangeAction.REMOVE_RECORD, approval, lineIdentity = identity)) return
+      val updated = item.copy(
+        selectedLinesJson = Json.encodeToString(keep),
+        endStationName = keep.firstOrNull()?.endStationName ?: item.endStationName,
+        lineNo = keep.firstOrNull()?.lineNo ?: item.lineNo,
+        upDown = keep.firstOrNull()?.upDown ?: item.upDown,
+        targetSequence = keep.firstOrNull()?.targetSequence ?: item.targetSequence,
+      )
+      try {
+        withContext(NonCancellable) {
+          withContext(Dispatchers.IO) { store.save(updated) }
+          mutableState.update { state ->
+            state.copy(
+              items = state.items.map { existing -> if (existing.stopCode == stopCode) updated else existing },
+              confirmation = state.confirmation?.takeIf { it.stopCode == stopCode }?.let { draft ->
+                draft.copy(original = updated, records = draft.records.filterNot { it.identity == identity }, selected = draft.selected - identity)
+              },
+              message = if (keep.isEmpty()) "过时记录已删除；关注项仍保留，可稍后重新选择线路" else "记录已删除，关注项仍保留",
+            )
+          }
+        }
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        mutableState.update { it.copy(message = "删除失败，记录仍保留，请重试") }
       }
-    } catch (error: Exception) {
-      if (error is CancellationException) throw error
-      mutableState.update { it.copy(message = "删除失败，记录仍保留，请重试") }
     }
   }
 
   /** 调整本地步行时间与预留余量：不需要联网，也不改变线路记录。 */
   suspend fun updateSettings(stopCode: String, walkMinutes: Double?, bufferMinutes: Double) {
-    val item = state.value.items.firstOrNull { it.stopCode == stopCode }
-      ?: runCatching { withContext(Dispatchers.IO) { store.find(stopCode) } }.getOrNull() ?: return
-    val updated = item.copy(walkMinutes = walkMinutes, bufferMinutes = bufferMinutes)
-    try {
-      withContext(Dispatchers.IO) { store.save(updated) }
-      mutableState.update { state ->
-        state.copy(items = state.items.map { existing -> if (existing.stopCode == stopCode) updated else existing }, message = "本地设置已保存")
+    taskChanges.withLock {
+      val item = readWatchItem(stopCode) ?: return
+      val updated = item.copy(walkMinutes = walkMinutes, bufferMinutes = bufferMinutes)
+      try {
+        withContext(Dispatchers.IO) { store.save(updated) }
+        mutableState.update { state ->
+          state.copy(items = state.items.map { existing -> if (existing.stopCode == stopCode) updated else existing }, message = "本地设置已保存，仅影响下一次等车")
+        }
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        mutableState.update { it.copy(message = "本地设置保存失败，原设置未改变") }
       }
-    } catch (error: Exception) {
-      if (error is CancellationException) throw error
-      mutableState.update { it.copy(message = "本地设置保存失败，原设置未改变") }
     }
   }
 
   fun requestDelete(stopCode: String) {
     if (state.value.saving) return
-    mutableState.update { it.copy(deleting = stopCode, message = null) }
+    val request = WatchItemDeletion(stopCode, activeTask(stopCode))
+    mutableState.update {
+      if (it.waitChange != null || it.deleting != null || it.preflight?.starting == true || it.saving) it
+      else it.copy(deleting = request, message = null)
+    }
   }
 
-  fun cancelDelete() { mutableState.update { it.copy(deleting = null) } }
+  fun cancelDelete(request: WatchItemDeletion? = state.value.deleting) {
+    mutableState.update { if (!it.saving && it.deleting === request) it.copy(deleting = null) else it }
+  }
 
-  suspend fun confirmDelete() {
-    val stopCode = state.value.deleting ?: return
-    try {
-      withContext(Dispatchers.IO) { store.delete(stopCode) }
-      revision.incrementAndGet()
-      mutableState.update {
-        it.copy(items = it.items.filterNot { item -> item.stopCode == stopCode }.sortedBy { item -> item.stationName }, deleting = null, confirmation = null, adding = false, message = "关注项已删除")
+  suspend fun confirmDelete(request: WatchItemDeletion? = state.value.deleting) {
+    if (request == null) return
+    taskChanges.withLock {
+      val current = state.value
+      if (current.deleting !== request || current.saving) return
+      val stopCode = request.stopCode
+      val id = activeTask(stopCode)
+      if (id != null && id != request.taskId) {
+        mutableState.update { it.copy(deleting = null, message = "当前等车已变化，请重新确认删除。") }
+        return
       }
-    } catch (error: Exception) {
-      if (error is CancellationException) throw error
-      mutableState.update { it.copy(deleting = null, message = "删除失败，关注项仍保留，请重试") }
+      if (!mutableState.compareAndSet(current, current.copy(saving = true))) return
+      try {
+        if (id != null && !stopForChange(id)) {
+          mutableState.update { it.copy(message = "上一轮的输出尚未停止，关注项未删除。") }
+          return
+        }
+        withContext(NonCancellable) {
+          withContext(Dispatchers.IO) { store.delete(stopCode) }
+          revision.incrementAndGet()
+          mutableState.update {
+            it.copy(items = it.items.filterNot { item -> item.stopCode == stopCode }, confirmation = null, adding = false,
+              preflight = it.preflight?.takeUnless { draft -> draft.stopCode == stopCode }, message = "关注项已删除")
+          }
+        }
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        mutableState.update { it.copy(message = "删除失败，关注项仍保留，请重试") }
+      } finally {
+        mutableState.update { it.copy(deleting = null, saving = false) }
+      }
     }
   }
 
@@ -759,29 +980,33 @@ class WatchItemApplication(
       return
     }
     var failed = 0
-    val verified = items.map { item ->
+    for (item in items) {
       val snapshot = try {
         source.resolveLines(item.stationName, item.stopCode)
       } catch (error: Exception) {
         if (error is CancellationException) throw error
         failed++
-        return@map item
+        continue
       }
-      val (checked, events) = reconcile(item, snapshot.value, snapshot.fetchedAt)
-      try {
-        withContext(Dispatchers.IO) { store.save(checked) }
+      val events = try {
+        taskChanges.withLock {
+          val saved = withContext(Dispatchers.IO) { store.find(item.stopCode) } ?: return@withLock emptyList()
+          if (saved.lastCheckedAt?.let { it > snapshot.fetchedAt } == true) return@withLock emptyList()
+          val (checked, events) = reconcile(saved, snapshot.value, snapshot.fetchedAt)
+          withContext(Dispatchers.IO) { store.save(checked) }
+          mutableState.update { state -> state.copy(items = state.items.map { if (it.stopCode == checked.stopCode) checked else it }) }
+          events
+        }
       } catch (error: Exception) {
         if (error is CancellationException) throw error
         failed++
-        return@map item
+        continue
       }
       // 通知是旁路：未授权或发送失败都不能影响已核对的数据。
       events.forEach { event -> runCatching { notifier.notify(event) } }
-      checked
     }
     mutableState.update {
       it.copy(
-        items = verified.sortedBy { item -> item.stationName },
         message = when {
           failed == 0 -> "已核对 ${items.size} 个关注项的线路"
           failed == items.size -> "线路核对失败：已保留上次成功数据与获取时间"
@@ -825,46 +1050,51 @@ class WatchItemApplication(
     restored = restored,
   )
 
-  suspend fun save() {
-    val current = state.value
-    val draft = current.confirmation ?: return
-    if (current.saving || current.loading) return
-    val selected = draft.availableLines.filter { it.identity in draft.selected }
-    if (selected.isEmpty()) {
-      mutableState.update { it.copy(message = "至少选择一条有效线路才能保存") }
-      return
-    }
-    mutableState.update { it.copy(saving = true, message = null) }
-    try {
-      // 编辑时一并保留未核对的过时记录，避免保存把记录悄悄丢掉。
-      val lines = selected.map { SavedLine(it.lineNo, it.upDown, it.endStationName, it.targetSequence, lineName = it.lineName) } + draft.records.filter { it.obsolete }
-      val first = lines.first()
-      val original = draft.original
-      val item = WatchItemEntity(
-        stopCode = draft.stopCode,
-        stationName = draft.station.stationName,
-        endStationName = first.endStationName,
-        lineNo = first.lineNo,
-        upDown = first.upDown,
-        targetSequence = first.targetSequence,
-        selectedLinesJson = Json.encodeToString(lines),
-        walkMinutes = original?.walkMinutes,
-        bufferMinutes = original?.bufferMinutes ?: 2.0,
-        lastCheckedAt = draft.fetchedAt ?: original?.lastCheckedAt,
-      )
-      // Room 写入和进程级 UI 状态必须一起完成，即使发起保存的 Activity 已销毁。
-      withContext(NonCancellable) {
-        withContext(Dispatchers.IO) { store.save(item) }
-        revision.incrementAndGet()
-        mutableState.update {
-          it.copy(items = (it.items.filterNot { saved -> saved.stopCode == item.stopCode } + item).sortedBy { saved -> saved.stationName }, saving = false, adding = false, editing = false, confirmation = null, message = "关注项已保存，没有开始等车")
-        }
+  suspend fun save() = save(null)
+
+  private suspend fun save(approval: WaitChange?) {
+    taskChanges.withLock {
+      val current = state.value
+      val draft = current.confirmation ?: return
+      if (current.saving || current.loading) return
+      val selected = draft.availableLines.filter { it.identity in draft.selected }
+      if (selected.isEmpty()) {
+        mutableState.update { it.copy(message = "至少选择一条有效线路才能保存") }
+        return
       }
-    } catch (error: Exception) {
-      if (error is CancellationException) throw error
-      mutableState.update { it.copy(saving = false, message = "保存失败，选线草稿仍保留，请重试；已有关注项未改变") }
-    } finally {
-      mutableState.update { it.copy(saving = false) }
+      if (!allowItemChange(draft.stopCode, WaitChangeAction.SAVE, approval, draft)) return
+      mutableState.update { it.copy(saving = true, message = null) }
+      try {
+        // 编辑时一并保留未核对的过时记录，避免保存把记录悄悄丢掉。
+        val lines = selected.map { SavedLine(it.lineNo, it.upDown, it.endStationName, it.targetSequence, lineName = it.lineName) } + draft.records.filter { it.obsolete }
+        val first = lines.first()
+        val original = draft.original
+        val item = WatchItemEntity(
+          stopCode = draft.stopCode,
+          stationName = draft.station.stationName,
+          endStationName = first.endStationName,
+          lineNo = first.lineNo,
+          upDown = first.upDown,
+          targetSequence = first.targetSequence,
+          selectedLinesJson = Json.encodeToString(lines),
+          walkMinutes = original?.walkMinutes,
+          bufferMinutes = original?.bufferMinutes ?: 2.0,
+          lastCheckedAt = draft.fetchedAt ?: original?.lastCheckedAt,
+        )
+        // Room 写入和进程级 UI 状态必须一起完成，即使发起保存的 Activity 已销毁。
+        withContext(NonCancellable) {
+          withContext(Dispatchers.IO) { store.save(item) }
+          revision.incrementAndGet()
+          mutableState.update {
+            it.copy(items = (it.items.filterNot { saved -> saved.stopCode == item.stopCode } + item).sortedBy { saved -> saved.stationName }, saving = false, adding = false, editing = false, confirmation = null, message = "关注项已保存，没有开始等车")
+          }
+        }
+      } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        mutableState.update { it.copy(saving = false, message = "保存失败，选线草稿仍保留，请重试；已有关注项未改变") }
+      } finally {
+        mutableState.update { it.copy(saving = false) }
+      }
     }
   }
 
@@ -883,6 +1113,21 @@ class WatchItemApplication(
 
 }
 
+enum class WaitChangeAction { REPLACE, EDIT, SAVE, REMOVE_RECORD }
+
+/** 每次对话框都有独立身份，迟到的确认不能复用至另一轮。 */
+class WaitChange internal constructor(
+  val action: WaitChangeAction,
+  val stopCode: String,
+  val taskId: Long,
+  internal val draft: Any? = null,
+  internal val withoutVoice: Boolean = false,
+  internal val lineIdentity: String? = null,
+)
+
+/** 删除确认也绑定打开时的任务身份（包括当时没有运行任务）。 */
+class WatchItemDeletion internal constructor(val stopCode: String, val taskId: Long?)
+
 data class WatchItemsState(
   val items: List<WatchItemEntity> = emptyList(),
   val adding: Boolean = false,
@@ -892,11 +1137,15 @@ data class WatchItemsState(
   val confirmation: WatchItemImportSession? = null,
   val loading: Boolean = false,
   val saving: Boolean = false,
-  val deleting: String? = null,
+  val deleting: WatchItemDeletion? = null,
+  val waitChange: WaitChange? = null,
+  val waitChangeCommitting: Boolean = false,
   val message: String? = null,
   val cameraActive: Boolean = false,
   val preflight: WaitPreflight? = null,
+  internal val notificationPermissionDraft: WaitPreflight? = null,
   val wait: WaitState = WaitState(),
+  val latestResult: WaitResult? = null,
   val voiceEnabled: Boolean = true,
 )
 
